@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { ApprovalCard } from '../components/approvals/ApprovalCard';
 import { RunPipeline } from '../components/demo/RunPipeline';
 import { VerdictGate } from '../components/payments/VerdictGate';
 import { Amount } from '../components/ui/Amount';
@@ -6,7 +7,15 @@ import { ErrorNotice } from '../components/ui/ErrorNotice';
 import type { Polled } from '../hooks/usePolling';
 import { usePolling } from '../hooks/usePolling';
 import { toUiError, type UiError } from '../lib/errors';
-import { findRoute, formatTime, isInFlight, routeLabel } from '../lib/labels';
+import {
+  catalogAmountForDecimals,
+  findRoute,
+  findToken,
+  formatTime,
+  isInFlight,
+  needsOwnerApproval,
+  routeLabel,
+} from '../lib/labels';
 import { api, newIdempotencyKey, PayGuardApiError } from '../lib/payguard-client';
 import type { PaymentPage } from '../lib/payments';
 import type { StoredRun } from '../lib/storage';
@@ -34,8 +43,11 @@ function runIsLive(view: RunView | null): boolean {
     return false;
   if (!view.payment) return true;
   return (
-    view.payment.executionStatus === 'AWAITING_APPROVAL' ||
-    isInFlight(view.payment.executionStatus, view.payment.policyDecision)
+    needsOwnerApproval(
+      view.payment.policyDecision,
+      view.payment.executionStatus,
+      view.payment.reasonCode,
+    ) || isInFlight(view.payment.executionStatus, view.payment.policyDecision)
   );
 }
 
@@ -107,6 +119,8 @@ export function DemoPage({
     (candidate) => candidate.profileId === profile.id,
   );
   const route = findRoute(config, profile.policy.config.routeId);
+  const settlementDecimals =
+    findToken(config, profile.policy.config.settlementToken)?.decimals ?? 6;
   const sourcePayment = payments.data?.records.find(
     (record) => record.vaultId === profile.vault.vaultId && record.executionStatus === 'SUCCEEDED',
   );
@@ -210,7 +224,10 @@ export function DemoPage({
                   {!scenario.requiresSourcePayment && (
                     <span className="num">
                       <Amount
-                        atomic={scenario.invoiceAmountAtomic}
+                        atomic={catalogAmountForDecimals(
+                          scenario.invoiceAmountAtomic,
+                          settlementDecimals,
+                        )}
                         token={profile.policy.config.settlementToken}
                       />
                     </span>
@@ -278,6 +295,27 @@ export function DemoPage({
           {view && <RunPipeline run={view.run} payment={view.payment} onApprovals={onApprovals} />}
         </section>
       </div>
+
+      {view?.payment &&
+        needsOwnerApproval(
+          view.payment.policyDecision,
+          view.payment.executionStatus,
+          view.payment.reasonCode,
+        ) && (
+          <ApprovalCard
+            payment={{
+              ...view.payment,
+              createdAt: view.payment.observedAt?.observedAt ?? new Date().toISOString(),
+            }}
+            profile={profile}
+            label={profileRuns.find((run) => run.runId === activeRunId)?.scenarioLabel ?? null}
+            onOpenPayment={onOpenPayment}
+            onChanged={() => {
+              void payments.refresh();
+              void active.refresh();
+            }}
+          />
+        )}
 
       {profileRuns.length > 0 && (
         <section className="panel">

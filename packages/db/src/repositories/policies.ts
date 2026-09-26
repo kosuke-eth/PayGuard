@@ -148,6 +148,18 @@ export async function archiveDraftRevision(
   return { kind: 'existing', row: mapRevisionRow(row) };
 }
 
+export async function getLatestDraftRevision(
+  db: Queryable,
+  draftId: string,
+): Promise<PolicyDraftRevisionRow | null> {
+  const result = await db.query(
+    'SELECT * FROM policy_draft_revisions WHERE draft_id = $1 ORDER BY draft_version DESC LIMIT 1',
+    [draftId],
+  );
+  const row = result.rows[0];
+  return row ? mapRevisionRow(row) : null;
+}
+
 export async function getDraftRevision(
   db: Queryable,
   params: { draftId: string; draftVersion: bigint },
@@ -384,6 +396,19 @@ export async function insertPolicyMerchants(
       ],
     );
   }
+}
+
+export async function supersedeActivePoliciesForAgent(
+  client: pg.PoolClient,
+  params: { vaultId: string; agent: Buffer; exceptPolicyId: string },
+): Promise<number> {
+  const result = await client.query(
+    `UPDATE policies
+     SET observed_status = 'SUPERSEDED'
+     WHERE vault_id = $1 AND agent = $2 AND observed_status = 'ACTIVE' AND id <> $3`,
+    [params.vaultId, params.agent, params.exceptPolicyId],
+  );
+  return result.rowCount ?? 0;
 }
 
 export async function getPolicyMerchants(

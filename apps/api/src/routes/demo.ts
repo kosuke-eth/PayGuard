@@ -32,6 +32,7 @@ import { requireIdempotencyKey, requireSession } from '../auth.js';
 import { requireVaultOwner } from '../authz.js';
 import type { AppContext } from '../context.js';
 import {
+  catalogAmountForDecimals,
   DEMO_SCENARIOS,
   type DemoProfile,
   findScenario,
@@ -176,12 +177,16 @@ async function orchestrate(
     if (!merchant) {
       throw new ApiError('RESOURCE_NOT_FOUND', 'this profile has no configured demo merchant');
     }
+    const outputAmount = catalogAmountForDecimals(
+      scenario.invoiceAmountAtomic,
+      profile.outputDecimals,
+    );
     const invoice: Invoice = {
       invoiceId: `0x${randomUUID().replace(/-/g, '').padEnd(64, '0')}` as `0x${string}`,
       merchantId: `0x${merchant.merchantId.toString('hex')}` as `0x${string}`,
       recipient: `0x${merchant.recipient.toString('hex')}` as `0x${string}`,
       settlementToken: profile.outputToken,
-      outputAmount: scenario.invoiceAmountAtomic,
+      outputAmount,
       category: merchant.category.toString(10),
       validUntil: '99999999999',
     };
@@ -217,9 +222,16 @@ async function orchestrate(
     policyId: profile.onchainPolicyId,
     invoiceHash,
     routeId: profile.routeId,
+    // Direct: input and output are the same token, so the invoice amount is the input bound.
+    // Swap routes (Uniswap v4 / Aqua): input is a different token and decimals; the invoice
+    // amount is output-side only. Bind the intent to the policy's real per-payment input cap
+    // so simulateExecutePayment can succeed. Copying the 6dp mUSDC invoice amount as mRWA wei
+    // is what made Demo Compute ALLOW then CANCELLED (MaxInputExceeded).
     maxInputAmount: scenario.requiresSourcePayment
       ? '1' // irrelevant for a duplicate attempt against an already-consumed invoice
-      : scenario.invoiceAmountAtomic,
+      : profile.inputToken.toLowerCase() === profile.outputToken.toLowerCase()
+        ? catalogAmountForDecimals(scenario.invoiceAmountAtomic, profile.outputDecimals)
+        : profile.maxInputPerPayment,
     nonce: Math.floor(Math.random() * 1_000_000_000).toString(10),
     validUntil: '99999999999',
     subsidyMode: 'NONE',
@@ -272,6 +284,20 @@ async function orchestrate(
     };
   }
 
+  if (evaluation.decision === 'ESCALATE') {
+    // Pause here. Submitting now would only queue a job the worker rejects as APPROVAL_REQUIRED
+    // (CANCELLED). The owner signs the exact approval through the normal API, then POST /submit.
+    // The bridge never auto-approves and never fabricates an owner signature.
+    return {
+      stage: 'intent',
+      orchestrationStatus: 'AWAITING_APPROVAL',
+      errorCode: evaluation.reasonCode ?? 'APPROVAL_REQUIRED',
+      paymentId,
+      intentId,
+      operationId: null,
+    };
+  }
+
   const submitResult = await injectJson(app, {
     method: 'POST',
     url: `/v1/payment-intents/${intentId}/submit`,
@@ -297,11 +323,7 @@ async function orchestrate(
   return {
     stage: 'submit',
     orchestrationStatus:
-      scenario.requiresSourcePayment && deduplicated
-        ? 'DUPLICATE_NOT_PAID_TWICE'
-        : evaluation.decision === 'ESCALATE'
-          ? 'AWAITING_APPROVAL'
-          : 'QUEUED',
+      scenario.requiresSourcePayment && deduplicated ? 'DUPLICATE_NOT_PAID_TWICE' : 'QUEUED',
     errorCode: null,
     paymentId,
     intentId,

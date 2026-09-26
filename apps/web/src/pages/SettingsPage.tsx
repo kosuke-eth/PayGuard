@@ -79,7 +79,7 @@ export function SettingsPage({ status }: { status: Polled<Readiness> }) {
               {[...agents].map(([address, routes]) => (
                 <div className="spread" key={address}>
                   <Party address={address} kind="agent" />
-                  <span className="small muted">{routes.join(' · ')}</span>
+                  <span className="small muted names-routes">{routes.join(' · ')}</span>
                 </div>
               ))}
               {agents.size === 0 && <span className="muted small">No agents yet.</span>}

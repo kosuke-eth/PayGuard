@@ -8,6 +8,10 @@
 import { claimDueJobs, type OutboxRow, retryJob } from '@payguard/db';
 import type pg from 'pg';
 import {
+  handleChainObservationJob,
+  type ObservationJobPayload,
+} from './observeChain.js';
+import {
   handlePaymentSubmissionJob,
   type SubmitDeps,
   type SubmitJobPayload,
@@ -30,6 +34,28 @@ async function dispatch(
     return { completed: false, error: 'claimed job has no lease_owner -- should be unreachable' };
   }
   switch (job.eventType) {
+    case 'CHAIN_OBSERVATION_REQUESTED': {
+      try {
+        const result = await handleChainObservationJob(
+          {
+            pool: deps.pool,
+            publicClient: deps.submitDeps.publicClient,
+            chainId: deps.submitDeps.config.chainId.toString(10),
+          },
+          {
+            id: job.id,
+            leaseOwner: job.leaseOwner,
+            leaseVersion: job.leaseVersion,
+            payload: job.payload as ObservationJobPayload,
+          },
+        );
+        return result.kind === 'DONE'
+          ? { completed: true }
+          : { completed: false, error: result.reason };
+      } catch (error) {
+        return { completed: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    }
     case 'PAYMENT_SUBMISSION_REQUESTED': {
       try {
         const result = await handlePaymentSubmissionJob(deps.submitDeps, {

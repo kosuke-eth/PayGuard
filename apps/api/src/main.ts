@@ -5,7 +5,7 @@
  */
 import { existsSync } from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createPool } from '@payguard/db';
 import { buildApp } from './app.js';
 import { loadConfig } from './config.js';
@@ -34,7 +34,7 @@ async function main(): Promise<void> {
   process.on('SIGTERM', shutdown);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((error: unknown) => {
     console.error(error);
     process.exitCode = 1;

@@ -25,9 +25,9 @@ export function PaymentRow({
       onClick={() => onOpen(record.paymentId)}
     >
       <span className="when small muted num">{formatTime(record.createdAt)}</span>
-      <span>
+      <span className="log-title">
         {name ?? <span className="mono">{shortHex(record.invoice?.recipient)}</span>}
-        {name && <span className="small muted mono"> {shortHex(record.invoice?.recipient)}</span>}
+        {name && <span className="small muted mono">{shortHex(record.invoice?.recipient)}</span>}
       </span>
       <span className="amount">
         <Amount atomic={record.invoice?.outputAmountAtomic} token={record.invoice?.outputToken} />

@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
 import { reasonText } from '../../lib/errors';
-import { findRoute, routeLabel } from '../../lib/labels';
+import { findRoute, needsOwnerApproval, routeLabel } from '../../lib/labels';
 import type { DemoRun, PaymentDetail } from '../../lib/types';
 import { useConfig } from '../../state/app';
 import { Amount, Hex } from '../ui/Amount';
@@ -110,8 +110,9 @@ function buildSteps(
   }
 
   if (decision === 'ESCALATE') {
+    const waiting = needsOwnerApproval(decision, status, payment?.reasonCode ?? run.errorCode);
     steps.push(
-      status === 'AWAITING_APPROVAL'
+      waiting
         ? {
             tone: 'wait',
             title: 'Waiting for the owner’s exact approval',
@@ -123,7 +124,7 @@ function buildSteps(
           }
         : { tone: 'done', title: 'Owner signed the exact approval' },
     );
-    if (status === 'AWAITING_APPROVAL') return steps;
+    if (waiting) return steps;
   }
 
   const hash = payment?.transaction?.hash;
@@ -137,6 +138,10 @@ function buildSteps(
       : {
           tone: status === 'CANCELLED' ? 'stop' : 'live',
           title: status === 'CANCELLED' ? 'Cancelled before submission' : 'Queued for the relayer',
+          detail:
+            status === 'CANCELLED'
+              ? (reasonText(payment?.reasonCode ?? run.errorCode) ?? undefined)
+              : undefined,
         },
   );
   if (!hash) return steps;

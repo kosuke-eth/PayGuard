@@ -8,7 +8,7 @@
 
 import { existsSync } from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createLocalPublicClient } from '@payguard/chain';
 import { createPool } from '@payguard/db';
 import type { Address } from '@payguard/domain';
@@ -115,7 +115,7 @@ async function resolveVaultAddresses(pool: pg.Pool, deploymentId: string): Promi
   );
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((error) => {
     console.error(error);
     process.exit(1);

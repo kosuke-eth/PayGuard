@@ -24,7 +24,7 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { PAYGUARD_VAULT_ABI, prepareCreatePolicy } from '@payguard/chain';
 import {
   createDeployment,
@@ -762,7 +762,7 @@ async function main() {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((error) => {
     console.error(error);
     process.exitCode = 1;

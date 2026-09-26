@@ -154,7 +154,7 @@ export function VaultDrawer({ profile, onClose }: { profile: Profile; onClose: (
               id="vault-amount"
               className="input num"
               inputMode="decimal"
-              placeholder="0.00"
+              placeholder="e.g. 1"
               value={amount}
               onChange={(event) => setAmount(event.target.value)}
             />
@@ -199,6 +199,12 @@ export function VaultDrawer({ profile, onClose }: { profile: Profile; onClose: (
           >
             Prepare {mode === 'DEPOSIT' ? 'deposit' : 'withdrawal'}
           </button>
+          {!amount && (
+            <p className="hint" style={{ marginTop: 8 }}>
+              Type an amount above zero in the field above — the 0.00 you saw was only a
+              placeholder.
+            </p>
+          )}
         </div>
       </section>
 

@@ -9,6 +9,7 @@ import { usePayments } from './hooks/usePayments';
 import { usePolling } from './hooks/usePolling';
 import { useStoredRuns } from './hooks/useRunLabels';
 import { useSystemStatus } from './hooks/useSystemStatus';
+import { needsOwnerApproval } from './lib/labels';
 import { api } from './lib/payguard-client';
 import { ActivityPage } from './pages/ActivityPage';
 import { ApprovalsPage } from './pages/ApprovalsPage';
@@ -41,7 +42,19 @@ function Workspace() {
   const [receiptId, setReceiptId] = useState<string | null>(null);
   const [vaultOpen, setVaultOpen] = useState(false);
   const payments = usePayments();
-  const pending = usePayments('AWAITING_APPROVAL');
+  const awaiting = usePayments('AWAITING_APPROVAL');
+  const pendingRecords = [
+    ...(awaiting.data?.records ?? []),
+    ...(payments.data?.records ?? []).filter((record) =>
+      needsOwnerApproval(record.policyDecision, record.executionStatus, record.reasonCode),
+    ),
+  ].filter(
+    (record, index, list) => list.findIndex((item) => item.paymentId === record.paymentId) === index,
+  );
+  const pending = {
+    ...awaiting,
+    data: awaiting.data || payments.data ? { records: pendingRecords, nextCursor: awaiting.data?.nextCursor ?? null } : null,
+  };
   const { runs, save, labelFor } = useStoredRuns();
   const status = useSystemStatus();
   // Test payments are offered only where the backend actually exposes them.
@@ -72,7 +85,7 @@ function Workspace() {
     if (settledCount > 0) void refreshProfiles();
   }, [settledCount]);
 
-  const pendingCount = pending.data ? pending.data.records.length : null;
+  const pendingCount = pending.data ? pendingRecords.length : null;
 
   useEffect(() => {
     document.title = `${pendingCount ? `(${pendingCount}) ` : ''}${TITLES[page]} · PayGuard`;
@@ -84,9 +97,9 @@ function Workspace() {
 
   const refreshAll = useCallback(() => {
     void payments.refresh();
-    void pending.refresh();
+    void awaiting.refresh();
     void refreshProfiles();
-  }, [payments, pending, refreshProfiles]);
+  }, [payments, awaiting, refreshProfiles]);
 
   let body: React.ReactNode;
   if (page === 'settings') {

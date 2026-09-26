@@ -275,8 +275,27 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const profile = useMemo(() => {
     if (!profiles || profiles.length === 0) return null;
-    return profiles.find((candidate) => candidate.id === selectedId) ?? profiles[0] ?? null;
+    const selected = profiles.find((candidate) => candidate.id === selectedId);
+    if (selected && selected.policy.status === 'ACTIVE') return selected;
+    // After replace, the stored id is the superseded snapshot. Follow the live policy
+    // for the same vault and agent instead of leaving Policies stuck on SUPERSEDED.
+    const vaultId = selected?.vault.vaultId;
+    const agent = selected?.policy.config.agent.toLowerCase();
+    const live = profiles.find(
+      (candidate) =>
+        candidate.policy.status === 'ACTIVE' &&
+        (vaultId ? candidate.vault.vaultId === vaultId : true) &&
+        (agent ? candidate.policy.config.agent.toLowerCase() === agent : true),
+    );
+    return live ?? selected ?? profiles[0] ?? null;
   }, [profiles, selectedId]);
+
+  useEffect(() => {
+    if (!profile || !config || !owner) return;
+    if (profile.id === selectedId) return;
+    setSelectedId(profile.id);
+    storage.setSelectedProfile(config.deploymentId, owner, profile.id);
+  }, [profile, selectedId, config, owner]);
 
   const selectProfile = useCallback(
     (id: string) => {

@@ -92,6 +92,28 @@ export function findScenario(scenarioId: string): DemoScenario | null {
   return DEMO_SCENARIOS.find((s) => s.scenarioId === scenarioId) ?? null;
 }
 
+/** Catalog invoice amounts are written at 6 decimals (the mUSDC narrative). */
+export const CATALOG_AMOUNT_DECIMALS = 6;
+
+/** Scale a catalog amount to the settlement token's real decimals (Aqua AQOUT is 18). */
+export function catalogAmountForDecimals(atomicAt6dp: string, decimals: number): string {
+  if (!atomicAt6dp || atomicAt6dp === '0') return atomicAt6dp;
+  if (decimals === CATALOG_AMOUNT_DECIMALS) return atomicAt6dp;
+  if (decimals > CATALOG_AMOUNT_DECIMALS) {
+    return `${atomicAt6dp}${'0'.repeat(decimals - CATALOG_AMOUNT_DECIMALS)}`;
+  }
+  return atomicAt6dp;
+}
+
+function tokenDecimals(configuration: unknown, address: string): number {
+  const tokens =
+    ((configuration as { tokens?: Array<{ address?: string; decimals?: number }> } | null)?.tokens ??
+    []);
+  const match = tokens.find((token) => (token.address ?? '').toLowerCase() === address.toLowerCase());
+  const decimals = Number(match?.decimals);
+  return Number.isFinite(decimals) && decimals >= 0 ? decimals : CATALOG_AMOUNT_DECIMALS;
+}
+
 export interface DemoProfile {
   profileId: string;
   label: string;
@@ -104,6 +126,8 @@ export interface DemoProfile {
   routeKind: string;
   inputToken: `0x${string}`;
   outputToken: `0x${string}`;
+  outputDecimals: number;
+  maxInputPerPayment: string;
   available: boolean;
 }
 
@@ -140,6 +164,8 @@ function toProfile(policy: PolicyRow, deploymentId: string, configuration: unkno
     routeKind: kind,
     inputToken: bufferToAddress(policy.inputToken),
     outputToken: bufferToAddress(policy.settlementToken),
+    outputDecimals: tokenDecimals(configuration, bufferToAddress(policy.settlementToken)),
+    maxInputPerPayment: policy.maxInputPerPayment.toString(10),
     // Both the route being configured+enabled AND the policy still being ACTIVE are required --
     // a REVOKED/EXPIRED/SUPERSEDED/ORPHANED policy is never presented as a usable demo profile,
     // regardless of what the route list says.

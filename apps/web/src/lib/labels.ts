@@ -72,6 +72,17 @@ export function isInFlight(status: ExecutionStatus, decision: PolicyDecision): b
   return ['QUEUED', 'SIGNED', 'SUBMITTED', 'UNKNOWN', 'INCLUDED', 'REORGED'].includes(status);
 }
 
+/** True when the owner still has to sign this exact payment before the relayer may submit. */
+export function needsOwnerApproval(
+  decision: PolicyDecision | null | undefined,
+  status: ExecutionStatus | null | undefined,
+  reasonCode?: string | null,
+): boolean {
+  if (decision !== 'ESCALATE') return false;
+  if (status === 'AWAITING_APPROVAL') return true;
+  return status === 'CANCELLED' && reasonCode === 'APPROVAL_REQUIRED';
+}
+
 export function categoriesFromBitmap(bitmap: string): number[] {
   let value = BigInt(bitmap);
   const result: number[] = [];
@@ -92,6 +103,14 @@ export function formatTime(iso: string): string {
     minute: '2-digit',
     second: '2-digit',
   });
+}
+
+/** Catalog scenario amounts are 6-decimal. Pad when this profile’s settlement token is 18dp. */
+export function catalogAmountForDecimals(atomicAt6dp: string, decimals: number): string {
+  if (!atomicAt6dp || atomicAt6dp === '0') return atomicAt6dp;
+  if (decimals === 6) return atomicAt6dp;
+  if (decimals > 6) return `${atomicAt6dp}${'0'.repeat(decimals - 6)}`;
+  return atomicAt6dp;
 }
 
 export function formatUnixSeconds(seconds: string): string {

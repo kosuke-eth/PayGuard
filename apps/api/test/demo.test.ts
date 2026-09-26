@@ -409,9 +409,8 @@ describe('POST /v1/demo/runs: hotel scenario (ESCALATE)', () => {
     expect(body.orchestrationStatus).toBe('AWAITING_APPROVAL');
     expect(body.intentId).toBeTruthy();
 
-    // With no approval yet, the worker cannot bring this to a successful settlement: the outbox
-    // drain must leave it short of DONE with a real chain-side ESCALATE denial, never a fabricated
-    // success.
+    // The run is not submitted until the owner signs. Draining the outbox must leave it unpaid —
+    // never a fabricated success, and never a worker CANCELLED that hides it from Approvals.
     await driveOutboxForIntent(body.intentId);
     const stillPending = await harness.pool.query(
       'SELECT execution_status FROM payments WHERE id = $1',
