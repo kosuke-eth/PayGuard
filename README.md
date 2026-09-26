@@ -1,94 +1,84 @@
 # PayGuard
 
-**An on-chain spending firewall for AI agents.**
+An AI agent that can pay is an agent that can empty the account. **PayGuard is the vault in between.**
 
-A person sets a budget and the merchants an agent may pay. The agent can propose a payment. It never holds the vault. Before any funds move, the vault decides one of three things:
+You set a budget, an automatic limit, and the merchants the agent may pay. The agent proposes a payment. It never holds the funds. The vault decides on-chain, before anything moves:
 
-| Decision | When | What happens |
-| --- | --- | --- |
-| **ALLOW** | Inside the automatic limit, to a permitted merchant | The relayer settles it. The owner is not asked to sign. |
-| **ESCALATE** | Above the automatic limit, still inside the approval limit | The payment stops. The owner signs that one payment, then it can settle. |
-| **BLOCK** | Over the budget, unknown merchant, or a replayed invoice | The vault refuses it. No transaction is sent and no funds move. |
+| | A small, allowed bill | A larger bill you did not pre-approve | Anything outside the rules |
+| --- | --- | --- | --- |
+| **Decision** | **ALLOW** | **ESCALATE** | **BLOCK** |
+| **In the local demo** | 0.50 settles on its own | 180 waits for your signature | 500 never leaves the vault |
+| **What you do** | Nothing | Sign that one payment | Nothing |
+| **What the merchant gets** | The exact invoiced amount | The exact amount, only after you sign | Nothing. No transaction is sent |
 
-The owner panel only shows what the API and the chain report. It never chooses ALLOW, ESCALATE, or BLOCK itself.
+The screen does not make this choice. It shows the decision the vault already made.
 
-## Payment flow
+## One payment, from proposal to receipt
 
 ```mermaid
 flowchart LR
-  A["Owner sets a policy<br/>budget, limits, merchants"] --> B["Agent signs a payment intent"]
-  B --> C["Merchant signs the invoice"]
-  C --> D["Vault evaluates on-chain"]
-  D --> E["ALLOW"]
-  D --> F["ESCALATE"]
-  D --> G["BLOCK"]
-  E --> H["Relayer submits settlement"]
-  F --> I["Owner signs this exact payment"]
-  I --> H
-  H --> J["Receipt: merchant was paid"]
-  G --> K["No transaction. Funds moved: 0"]
+  Owner["You set the rules"] --> Agent["Agent signs an intent"]
+  Agent --> Merchant["Merchant signs the invoice"]
+  Merchant --> Vault["Vault evaluates on-chain"]
+  Vault --> Allow["ALLOW"]
+  Vault --> Escalate["ESCALATE"]
+  Vault --> Block["BLOCK"]
+  Allow --> Relayer["Relayer settles"]
+  Escalate --> Sign["You sign this exact payment"]
+  Sign --> Relayer
+  Relayer --> Paid["Receipt: merchant was paid"]
+  Block --> Stop["No transaction. Funds moved: 0"]
 ```
 
-ALLOW goes straight through. ESCALATE waits for one owner signature and does not change the merchant, amount, or route. BLOCK ends in the vault. A stopped relayer leaves an allowed payment queued; it is not marked paid until a receipt exists.
+ALLOW goes straight through. ESCALATE pauses until you sign, and the signature cannot change the merchant, the amount, or the route. BLOCK ends inside the vault. If the relayer is down, an allowed payment stays queued. It is not marked paid until a receipt exists.
 
-## Three lanes
+## Three budgets, not one shared wallet
 
-```mermaid
-flowchart TB
-  Agent["Agent proposes a payment"] --> Vault["PayGuard vault"]
-  Vault -->|"under the automatic limit"| Allow["ALLOW → merchant"]
-  Vault -->|"above automatic, within approval"| Escalate["ESCALATE → owner signature → merchant"]
-  Vault -->|"over budget, unknown merchant, or replay"| Block["BLOCK → nothing is settled"]
-```
+The same agent can spend through more than one route. Each route is its own vault and its own budget. A payment on Uniswap v4 does not reduce the Direct or Aqua budget.
 
-Each route has its own vault and its own budget. Spending on one route does not reduce the others.
-
-| Route | What the merchant receives |
+| Route | How the merchant is paid |
 | --- | --- |
-| **Direct transfer** | The settlement token, paid from the vault |
-| **Uniswap v4** | The invoiced output token. The vault spends its input token through the pool |
-| **Aqua / SwapVM** | The invoiced output token, through the Aqua route |
+| **Direct transfer** | The settlement token moves straight from the vault |
+| **Uniswap v4** | The vault spends its input token through the pool. The merchant receives the invoiced output |
+| **Aqua / SwapVM** | Same shape as the swap route, through Aqua |
 
-## What you can do in the panel
+## What you see after you sign in
 
-Sign in with your wallet (SIWE). Then:
+The panel is the owner’s view of one agent. You connect a wallet, then:
 
-- **Overview** — remaining budget, the three limits, and the latest decision
-- **Policies** — the rules stored on the vault: budget, automatic limit, approval limit, assets, route, and allowed merchants
-- **Test payments** — scripted invoices through the same API, relayer, and vault as any payment
-- **Approvals** — escalated payments waiting for your signature
-- **Activity** — the policy decision and what actually happened on-chain, kept separate
-- **Settings** — your account, local names, and whether the database, chain, relayer, and vault contracts are ready
-- **Vault controls** — pause, resume, deposit, withdraw, replace a policy, or revoke one
+- **Overview** shows the remaining budget and the three limits.
+- **Policies** reads the rules back from the vault.
+- **Test payments** sends a scripted invoice through the real API, relayer, and vault.
+- **Approvals** lists payments that escalated and are waiting for you.
+- **Activity** separates the policy’s decision from what happened on-chain.
+- **Vault controls** let you pause spending, move funds, replace a policy, or revoke one.
 
-Replacing a policy creates a new on-chain policy. Revoking one stops that policy from spending. The owner’s private key stays in the wallet. The API and the worker refuse to start if an owner key is placed in the environment.
+Your private key stays in the wallet. The API and the worker refuse to boot if an owner key is put in the environment.
 
-## How the pieces fit
+## How it is built
 
 ```mermaid
 flowchart LR
-  Browser["Owner panel<br/>apps/web"] --> API["API<br/>apps/api"]
+  Panel["Owner panel"] --> API["API"]
   API --> DB["PostgreSQL"]
-  API --> Chain["Vault contracts"]
-  Worker["Relayer worker<br/>apps/worker"] --> DB
-  Worker --> Chain
-  Chain --> Direct["Direct transfer"]
-  Chain --> V4["Uniswap v4"]
-  Chain --> Aqua["Aqua / SwapVM"]
+  API --> Vault["Vault"]
+  Worker["Relayer"] --> DB
+  Worker --> Vault
+  Vault --> Routes["Direct · Uniswap v4 · Aqua"]
 ```
 
-| Path | Role |
+| Piece | Where it lives |
 | --- | --- |
-| `apps/web` | React 19 + Vite owner panel. Talks to `/v1` on the same origin. |
-| `apps/api` | Fastify API. Sessions, policies, invoices, intents, approvals, and the demo bridge. |
-| `apps/worker` | Submits queued settlements and records what the chain did, including a replaced policy. |
-| `contracts/core-v4` | Vault, policy evaluation, and the Uniswap v4 adapter. |
-| `contracts/aqua` | Aqua / SwapVM route. |
-| `packages/` | Shared database, domain types, chain bindings, and integration code. |
+| Owner panel | `apps/web` — React 19 and Vite. Calls `/v1` on the same origin. |
+| API | `apps/api` — sessions, policies, invoices, intents, and approvals. |
+| Relayer | `apps/worker` — submits queued settlements and records the chain, including a replaced policy. |
+| Vault and Uniswap v4 | `contracts/core-v4` |
+| Aqua / SwapVM | `contracts/aqua` |
+| Shared libraries | `packages/` |
 
-## Run it locally
+## Run the demo
 
-You need Node.js 24 or newer, pnpm 10.33.0, PostgreSQL 17, and [Foundry](https://book.getfoundry.sh/) (Anvil). Assets in the local demo are mock tokens on chain `31337`. No real funds move.
+Node.js 24+, pnpm 10.33.0, PostgreSQL 17, and [Foundry](https://book.getfoundry.sh/). The demo uses mock tokens on local chain `31337`. No real funds move.
 
 ```bash
 git clone https://github.com/kosuke-eth/PayGuard.git
@@ -96,12 +86,11 @@ cd PayGuard
 corepack enable
 corepack prepare pnpm@10.33.0 --activate
 pnpm install
-
 cp .env.example .env
 cp apps/web/.env.example apps/web/.env
 ```
 
-Create the local database role and databases (`payguard` / `payguard_local_dev`, databases `payguard_dev` and `payguard_test`), then:
+Create the `payguard` database role, then:
 
 ```bash
 pnpm --filter @payguard/db migrate
@@ -109,7 +98,7 @@ anvil
 pnpm --filter @payguard/api exec tsx scripts/demo-setup.ts
 ```
 
-`demo-setup` prints `PAYGUARD_DEPLOYMENT_ID`. Paste that value into `.env`, then start three processes:
+Paste the printed `PAYGUARD_DEPLOYMENT_ID` into `.env`. Start the API, the relayer, and the panel:
 
 ```bash
 pnpm --filter @payguard/api dev
@@ -117,16 +106,16 @@ pnpm --filter @payguard/worker dev
 pnpm --filter @payguard/web dev
 ```
 
-Open **http://localhost:5173** (not `127.0.0.1`). Import the Anvil owner account into your wallet and sign in. Step-by-step notes, including Windows, are in [docs/ENV_SETUP.md](docs/ENV_SETUP.md).
+Open [http://localhost:5173](http://localhost:5173). Use that host, not `127.0.0.1`. Import the Anvil owner account into your wallet and sign in.
 
-The first time you copy `.env.example`, `PAYGUARD_DEPLOYMENT_ID` is still a placeholder. The API will not serve a deployment until `demo-setup` has printed a real id and you have saved it.
+Full setup, including Windows, is in [docs/ENV_SETUP.md](docs/ENV_SETUP.md).
 
-## Try the three decisions
+## See the three decisions yourself
 
-After sign-in, choose an **active** agent in the dropdown. On **Test payments**:
+Choose an **active** agent, open **Test payments**, and run these in order:
 
-1. **Run Demo Compute** — a small invoice. Expected result: **ALLOW**, then a settlement receipt.
-2. **Run Demo Hotel** — above the automatic limit and within the approval limit. Expected result: **ESCALATE**. Sign that card under **Approvals**. The merchant is paid only after that signature.
-3. **Run Over Hard Budget** — above the total budget. Expected result: **BLOCK**. No transaction, and funds moved stay at 0.
+1. **Demo Compute** — ALLOW. A receipt appears, and the merchant is paid.
+2. **Demo Hotel** — ESCALATE. Open **Approvals**, sign that card, and the same payment then settles.
+3. **Over Hard Budget** — BLOCK. There is no transaction, and funds moved stay at 0.
 
-A revoked policy cannot spend. Switch to an active route before starting a payment.
+If a policy says revoked, pick another route. A revoked vault will not spend.
