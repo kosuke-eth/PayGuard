@@ -7,12 +7,22 @@
  * relayer's real on-chain native balance via `context.config.relayerAddress` (a PUBLIC address --
  * the API process never holds the relayer's private key, only where it can check gas funding) and
  * fails on zero balance, since a relayer with no gas cannot broadcast anything.
+ *
+ * B1 (INT-006) adds `vaultCode`: a matching `chainId` or nonempty `getCode` alone does not prove the
+ * address we believe is a PayGuardVault still IS one -- an address can be redeployed/self-destructed/
+ * reused across a chain reset. Each registered `vaults` row was stamped with `runtime_code_hash` at
+ * provisioning time (the actual `keccak256(getCode(vaultAddress))` observed then); this check
+ * re-observes the SAME live code now and refuses readiness on any drift, rather than trusting the
+ * stored row forever. `abiSchemaVersion` catches the same class of problem for the binding version we
+ * compiled against, not just the deployed bytes.
  */
 
-import { getDeploymentById, getFreshestHeartbeat } from '@payguard/db';
+import { getDeploymentById, getFreshestHeartbeat, getVaultsByDeployment } from '@payguard/db';
 import type { FastifyInstance } from 'fastify';
+import { keccak256 } from 'viem';
 import type { AppContext } from '../context.js';
 import { successEnvelope } from '../errors.js';
+import { EXPECTED_ABI_SCHEMA_VERSION } from './config.js';
 
 interface ReadinessCheck {
   name: string;
@@ -136,6 +146,66 @@ export function registerHealthRoutes(app: FastifyInstance, context: AppContext):
         ok: false,
         detail: 'no relayer address configured',
       });
+    }
+
+    // Vault runtime-code and ABI-binding identity: a chain ID match or nonempty `getCode` alone is
+    // not proof the configured vault address is still our vault. Every registered vault must show
+    // live code matching what was observed at provisioning, and a schema version we actually
+    // compiled bindings for -- a mismatch on either fails readiness closed, not open.
+    if (context.publicClient) {
+      try {
+        const vaults = await getVaultsByDeployment(context.pool, context.config.deploymentId);
+        if (vaults.length === 0) {
+          checks.push({
+            name: 'vaultCode',
+            ok: true,
+            detail: 'no vaults registered for this deployment yet',
+          });
+        } else {
+          const mismatches: string[] = [];
+          for (const vault of vaults) {
+            const addressHex = `0x${vault.address.toString('hex')}` as `0x${string}`;
+            let observedCodeHash: string;
+            try {
+              const code = await context.publicClient.getCode({ address: addressHex });
+              if (!code || code === '0x') {
+                mismatches.push(`${vault.id}: no code at ${addressHex} (EOA or self-destructed)`);
+                continue;
+              }
+              observedCodeHash = keccak256(code);
+            } catch (error) {
+              mismatches.push(
+                `${vault.id}: getCode failed (${error instanceof Error ? error.message : 'rpc error'})`,
+              );
+              continue;
+            }
+            const expectedCodeHash = `0x${vault.runtimeCodeHash.toString('hex')}`;
+            if (observedCodeHash.toLowerCase() !== expectedCodeHash.toLowerCase()) {
+              mismatches.push(
+                `${vault.id}: runtime code changed since provisioning (expected ${expectedCodeHash}, observed ${observedCodeHash})`,
+              );
+            }
+            if (vault.abiSchemaVersion !== EXPECTED_ABI_SCHEMA_VERSION) {
+              mismatches.push(
+                `${vault.id}: registered abiSchemaVersion=${vault.abiSchemaVersion}, this build expects ${EXPECTED_ABI_SCHEMA_VERSION}`,
+              );
+            }
+          }
+          checks.push({
+            name: 'vaultCode',
+            ok: mismatches.length === 0,
+            detail:
+              mismatches.length === 0
+                ? `${vaults.length} vault(s) verified against live code + abiSchemaVersion=${EXPECTED_ABI_SCHEMA_VERSION}`
+                : mismatches.join('; '),
+          });
+        }
+      } catch (error) {
+        request.log.error({ err: error }, 'health check: vault code verification failed');
+        checks.push({ name: 'vaultCode', ok: false, detail: 'vault lookup or getCode failed' });
+      }
+    } else {
+      checks.push({ name: 'vaultCode', ok: false, detail: 'no chain client configured' });
     }
 
     const ready = checks.every((check) => check.ok);

@@ -43,6 +43,8 @@ function inertContext(): AppContext {
       challengeTtlSeconds: 300,
       relayerAddress: null,
       tlsEnabled: false,
+      workerHeartbeatStalenessSeconds: 30,
+      demo: null,
     },
     // Route REGISTRATION never queries the pool or chain client -- only handler execution does.
     pool: {} as pg.Pool,

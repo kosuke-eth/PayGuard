@@ -13,6 +13,13 @@ import type { FastifyInstance } from 'fastify';
 import type { AppContext } from '../context.js';
 import { ApiError, successEnvelope } from '../errors.js';
 
+/**
+ * The single expected wire/ABI-binding schema version this build understands. Shared with
+ * `health.ts`'s readiness check (B1, INT-006) so "the config we advertise" and "the version we
+ * actually verify a vault's code was registered against" cannot silently drift from each other.
+ */
+export const EXPECTED_ABI_SCHEMA_VERSION = '1' as const;
+
 export interface PublicTokenConfig {
   address: string;
   symbol: string;
@@ -130,7 +137,7 @@ export function projectPublicConfig(params: {
     environment: params.environment,
     chainId: params.chainId.toString(10),
     schemaVersion: '1',
-    abiSchemaVersion: '1',
+    abiSchemaVersion: EXPECTED_ABI_SCHEMA_VERSION,
     tokens,
     routes,
     confidencePolicy: {

@@ -52,6 +52,27 @@ export interface ApiConfig {
   tlsEnabled: boolean;
   /** GET /health/ready: a worker_heartbeat row older than this fails the `worker` check. */
   workerHeartbeatStalenessSeconds: number;
+  /**
+   * B2: the demo bridge (`/v1/demo/*`). `undefined` when demo mode is off -- the routes gate on
+   * this being present, never on `environment === 'LOCAL_DEMO'` alone (an operator could point a
+   * LOCAL_DEMO-labeled deployment at real value; the label is not authorization). These are
+   * ISOLATED demo merchant/agent signing keys, never the owner key -- `assertNoOwnerKeyConfigured`
+   * above still applies unconditionally and independently of this flag.
+   */
+  demo: DemoConfig | null;
+}
+
+export interface DemoConfig {
+  /** Merchant identity the bridge signs demo invoices with, for pre-enrolled demo profiles only. */
+  merchantPrivateKey: `0x${string}`;
+  /** Agent identity the bridge signs demo intents with and logs in as via real SIWE, per run. */
+  agentPrivateKey: `0x${string}`;
+  /**
+   * A THIRD identity, deliberately never registered as an `invoiceSigner` on any demo policy --
+   * used only by the "unauthorized merchant" scenario to produce a REAL `INVALID_SIGNATURE`
+   * rejection from `/v1/invoices`, never a fabricated one.
+   */
+  unauthorizedMerchantPrivateKey: `0x${string}`;
 }
 
 /** Environment variable names that would imply an owner signing key lives in this process. */
@@ -87,22 +108,84 @@ function required(env: NodeJS.ProcessEnv, name: string): string {
   return value;
 }
 
+/** Strict positive-integer parse (port/TTL/staleness vars) -- never silently coerces to NaN/0. */
+function optionalInt(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const raw = env[name];
+  if (raw === undefined) return fallback;
+  if (!/^[0-9]+$/.test(raw) || Number.parseInt(raw, 10) <= 0) {
+    throw new Error(`invalid environment variable ${name}: expected a positive integer, got "${raw}"`);
+  }
+  return Number.parseInt(raw, 10);
+}
+
+/** Strict BigInt parse (CHAIN_ID) -- BigInt() on garbage input throws an unlabeled SyntaxError. */
+function optionalBigInt(env: NodeJS.ProcessEnv, name: string, fallback: string): bigint {
+  const raw = env[name] ?? fallback;
+  if (!/^[0-9]+$/.test(raw)) {
+    throw new Error(`invalid environment variable ${name}: expected a non-negative integer, got "${raw}"`);
+  }
+  return BigInt(raw);
+}
+
+function optionalEnum<T extends string>(
+  env: NodeJS.ProcessEnv,
+  name: string,
+  allowed: readonly T[],
+  fallback: T,
+): T {
+  const raw = env[name];
+  if (raw === undefined) return fallback;
+  if (!(allowed as readonly string[]).includes(raw)) {
+    throw new Error(
+      `invalid environment variable ${name}: expected one of [${allowed.join(', ')}], got "${raw}"`,
+    );
+  }
+  return raw as T;
+}
+
+/** Loose hex-private-key shape check -- not a cryptographic validation, just "looks like a key". */
+function isHexPrivateKey(value: string): value is `0x${string}` {
+  return /^0x[0-9a-fA-F]{64}$/.test(value);
+}
+
+function loadDemoConfig(env: NodeJS.ProcessEnv): DemoConfig | null {
+  if (env.PAYGUARD_DEMO_ENABLED !== 'true') return null;
+  const merchant = required(env, 'DEMO_MERCHANT_PRIVATE_KEY');
+  const agent = required(env, 'DEMO_AGENT_PRIVATE_KEY');
+  const unauthorizedMerchant = required(env, 'DEMO_UNAUTHORIZED_MERCHANT_PRIVATE_KEY');
+  for (const [name, value] of [
+    ['DEMO_MERCHANT_PRIVATE_KEY', merchant],
+    ['DEMO_AGENT_PRIVATE_KEY', agent],
+    ['DEMO_UNAUTHORIZED_MERCHANT_PRIVATE_KEY', unauthorizedMerchant],
+  ] as const) {
+    if (!isHexPrivateKey(value)) {
+      throw new Error(`${name} must be a 0x-prefixed 32-byte hex private key`);
+    }
+  }
+  return {
+    merchantPrivateKey: merchant as `0x${string}`,
+    agentPrivateKey: agent as `0x${string}`,
+    unauthorizedMerchantPrivateKey: unauthorizedMerchant as `0x${string}`,
+  };
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
   assertNoOwnerKeyConfigured(env);
 
   const tlsEnabled = env.API_TLS_ENABLED === 'true';
   const host = env.API_HOST ?? '127.0.0.1';
-  const port = Number.parseInt(env.API_PORT ?? '3000', 10);
+  const port = optionalInt(env, 'API_PORT', 3000);
   const scheme = tlsEnabled ? 'https' : 'http';
   const siweDomain = env.API_SIWE_DOMAIN ?? `${host}:${port}`;
+  const sessionTtlSeconds = optionalInt(env, 'API_SESSION_TTL_SECONDS', 3600);
 
   return {
     port,
     host,
     databaseUrl: required(env, 'DATABASE_URL'),
     rpcUrl: env.RPC_URL ?? 'http://127.0.0.1:8545',
-    chainId: BigInt(env.CHAIN_ID ?? '31337'),
-    environment: (env.PAYGUARD_ENVIRONMENT as Environment) ?? 'LOCAL_DEMO',
+    chainId: optionalBigInt(env, 'CHAIN_ID', '31337'),
+    environment: optionalEnum(env, 'PAYGUARD_ENVIRONMENT', ['LOCAL_DEMO', 'TESTNET'], 'LOCAL_DEMO'),
     deploymentId: required(env, 'PAYGUARD_DEPLOYMENT_ID'),
     siweDomain,
     siweUri: env.API_SIWE_URI ?? `${scheme}://${siweDomain}`,
@@ -113,17 +196,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
     cookie: {
       name: env.API_COOKIE_NAME ?? 'payguard_session',
       secure: env.API_COOKIE_SECURE !== 'false',
-      sameSite: (env.API_COOKIE_SAMESITE as CookieConfig['sameSite']) ?? 'Strict',
+      sameSite: optionalEnum(env, 'API_COOKIE_SAMESITE', ['Strict', 'Lax', 'None'], 'Strict'),
       path: '/',
-      maxAgeSeconds: Number.parseInt(env.API_SESSION_TTL_SECONDS ?? '3600', 10),
+      maxAgeSeconds: sessionTtlSeconds,
     },
-    sessionTtlSeconds: Number.parseInt(env.API_SESSION_TTL_SECONDS ?? '3600', 10),
-    challengeTtlSeconds: Number.parseInt(env.API_CHALLENGE_TTL_SECONDS ?? '300', 10),
+    sessionTtlSeconds,
+    challengeTtlSeconds: optionalInt(env, 'API_CHALLENGE_TTL_SECONDS', 300),
     relayerAddress: env.RELAYER_ADDRESS ?? null,
     tlsEnabled,
-    workerHeartbeatStalenessSeconds: Number.parseInt(
-      env.API_WORKER_HEARTBEAT_STALENESS_SECONDS ?? '30',
-      10,
-    ),
+    workerHeartbeatStalenessSeconds: optionalInt(env, 'API_WORKER_HEARTBEAT_STALENESS_SECONDS', 30),
+    demo: loadDemoConfig(env),
   };
 }

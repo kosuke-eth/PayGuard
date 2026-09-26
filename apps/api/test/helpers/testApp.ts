@@ -6,7 +6,14 @@
  * every DB/chain interaction underneath is real).
  */
 import { randomUUID } from 'node:crypto';
-import { type DeployedVaultFixture, deployVaultFixture, spawnAnvil } from '@payguard/test-utils';
+import {
+  AGENT_PRIVATE_KEY,
+  type DeployedVaultFixture,
+  deployVaultFixture,
+  MERCHANT_PRIVATE_KEY,
+  RELAYER_PRIVATE_KEY,
+  spawnAnvil,
+} from '@payguard/test-utils';
 import { createPublicClient, http, keccak256, toHex } from 'viem';
 import { type BuiltApp, buildApp } from '../../src/app.js';
 import { loadConfig } from '../../src/config.js';
@@ -23,7 +30,7 @@ export interface TestHarness {
   stopAnvil: () => Promise<void>;
 }
 
-export async function createTestHarness(): Promise<TestHarness> {
+export async function createTestHarness(options?: { demoEnabled?: boolean }): Promise<TestHarness> {
   const pool = getTestPool();
   await ensureMigrated(pool);
   await truncateAll(pool);
@@ -74,6 +81,18 @@ export async function createTestHarness(): Promise<TestHarness> {
     API_SIWE_URI: 'http://127.0.0.1:3999',
     API_ALLOWED_ORIGINS: 'http://127.0.0.1:3999',
     RELAYER_ADDRESS: fixture.ownerAccount.address,
+    // B2: the demo bridge's isolated signing identities are the SAME fixture accounts already
+    // bound as `agent`/`invoiceSigner` on demo policies seeded via `seedPolicy` -- never the owner
+    // key. `unauthorizedMerchant` reuses the relayer's key specifically because it is guaranteed,
+    // by this fixture's own design, to never be bound to any policy anywhere.
+    ...(options?.demoEnabled
+      ? {
+          PAYGUARD_DEMO_ENABLED: 'true',
+          DEMO_AGENT_PRIVATE_KEY: AGENT_PRIVATE_KEY,
+          DEMO_MERCHANT_PRIVATE_KEY: MERCHANT_PRIVATE_KEY,
+          DEMO_UNAUTHORIZED_MERCHANT_PRIVATE_KEY: RELAYER_PRIVATE_KEY,
+        }
+      : {}),
   });
 
   const publicClient = createPublicClient({
@@ -117,6 +136,12 @@ export async function seedOwnerVault(
 
   const vaultId = uuid();
   const vaultAddressBytes = Buffer.from(harness.fixture.vaultAddress.slice(2), 'hex');
+  // B1 (INT-006): the vault's real deployed code, not a placeholder hash -- health.ts's `vaultCode`
+  // check re-observes live code and compares it against exactly this value.
+  const deployedCode = await harness.fixture.publicClient.getCode({
+    address: harness.fixture.vaultAddress,
+  });
+  if (!deployedCode) throw new Error('seedOwnerVault: no code observed at vault address');
   await harness.pool.query(
     `INSERT INTO vaults (id, deployment_id, owner_wallet_id, address, runtime_code_hash, abi_schema_version)
      VALUES ($1,$2,$3,$4,$5,'1')
@@ -126,7 +151,7 @@ export async function seedOwnerVault(
       harness.deploymentId,
       resolvedWalletId,
       vaultAddressBytes,
-      Buffer.from(keccak256(toHex('runtime')).slice(2), 'hex'),
+      Buffer.from(keccak256(deployedCode).slice(2), 'hex'),
     ],
   );
   const existingVault = await harness.pool.query(
@@ -143,7 +168,7 @@ export async function seedOwnerVault(
  * stores, so `resolveSession` finds it the same way a real session would be found.
  */
 export async function seedSession(
-  harness: TestHarness,
+  harness: Pick<TestHarness, 'pool'>,
   params: { walletId: string; sessionKind: 'BROWSER' | 'AGENT'; chainId?: bigint },
 ): Promise<{ token: string; csrfToken: string | null }> {
   const { createHash, randomBytes } = await import('node:crypto');
