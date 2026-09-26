@@ -70,6 +70,45 @@ describe('EIP-712 digests: negative cases (wrong-domain / changed-field must NOT
   });
 });
 
+/**
+ * B2 (docs/PAYGUARD_AGENT_WORKFLOW.md): "a new deployment UUID alone must NOT invalidate old
+ * EIP-712 signatures -- only a genuinely fresh verifying-contract address or changed chain domain
+ * may do that." `PayGuardDomain` (`src/eip712.ts`) is structurally `{ chainId, verifyingContract }`
+ * only -- a deployment id is never a field of it, so no deployment-row identity can reach the
+ * digest through any path. These tests make that invariant explicit rather than leaving it as an
+ * implication of the type shape.
+ */
+describe('EIP-712 digests: deployment-record identity never participates in the domain', () => {
+  it('two domains built for the SAME chain + vault produce the IDENTICAL digest, regardless of which deployment record they were derived from', () => {
+    // Simulates re-registering the SAME live vault under a brand new `deployments.id` row (an
+    // operational relabel, never a destructive reset) -- the domain is rebuilt from scratch here,
+    // not reused, to prove the equality is structural and not merely object identity.
+    const domainFromDeploymentA = {
+      chainId: TEST_DOMAIN.chainId,
+      verifyingContract: TEST_DOMAIN.verifyingContract,
+    };
+    const domainFromDeploymentB = {
+      chainId: TEST_DOMAIN.chainId,
+      verifyingContract: TEST_DOMAIN.verifyingContract,
+    };
+    expect(hashInvoice(domainFromDeploymentB, FIXTURE_INVOICE)).toBe(
+      hashInvoice(domainFromDeploymentA, FIXTURE_INVOICE),
+    );
+    expect(hashIntent(domainFromDeploymentB, FIXTURE_INTENT)).toBe(
+      hashIntent(domainFromDeploymentA, FIXTURE_INTENT),
+    );
+  });
+
+  it('an EXPLICIT reset that deploys a genuinely new vault address changes the digest, so old signatures stop validating', () => {
+    // The only thing distinguishing WRONG_DOMAIN_CONTRACT from TEST_DOMAIN is verifyingContract --
+    // exactly what a real `scripts/demo-reset.ts` redeploy changes, and a deployment-row relabel
+    // (above) never does.
+    expect(hashInvoice(WRONG_DOMAIN_CONTRACT, FIXTURE_INVOICE)).not.toBe(
+      hashInvoice(TEST_DOMAIN, FIXTURE_INVOICE),
+    );
+  });
+});
+
 describe('EIP-712 digests: committed evidence file has not drifted from current code', () => {
   it('docs/implementation/evidence/eip712-vectors.json exists (run `pnpm vectors:generate` first)', () => {
     expect(existsSync(evidencePath)).toBe(true);
