@@ -1,0 +1,9 @@
+[submodule "contracts/core-v4/lib/v4-core"]
+	path = contracts/core-v4/lib/v4-core
+	url = https://github.com/Uniswap/v4-core
+[submodule "contracts/core-v4/lib/forge-std"]
+	path = contracts/core-v4/lib/forge-std
+	url = https://github.com/foundry-rs/forge-std
+[submodule "contracts/core-v4/lib/openzeppelin-contracts"]
+	path = contracts/core-v4/lib/openzeppelin-contracts
+	url = https://github.com/OpenZeppelin/openzeppelin-contracts

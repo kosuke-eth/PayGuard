@@ -1,1 +1,55 @@
+# Operating system files
 .DS_Store
+.AppleDouble
+.LSOverride
+Icon[\r]
+._*
+
+# Editor and local agent state
+.idea/
+.vscode/
+*.code-workspace
+/.claude/
+CLAUDE.md
+PAYGUARD_BUILD_PROMPTS.md
+
+# Dependencies and package-manager state
+node_modules/
+.pnpm-store/
+.npm/
+.yarn/
+.pnp.*
+
+# JavaScript / TypeScript build and test output
+dist/
+build/
+coverage/
+.nyc_output/
+*.tsbuildinfo
+*.tsbuildinfo.*
+
+# Tool caches and temporary files
+.cache/
+.turbo/
+.eslintcache
+*.log
+logs/
+tmp/
+temp/
+
+# Environment files and local credentials.
+# Keep templates in version control so setup remains reproducible.
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.local.json
+
+# Foundry generated artifacts and local script broadcasts.
+# Do not ignore lib/: its pinned submodules are part of the source tree.
+contracts/*/out/
+contracts/*/cache/
+contracts/*/broadcast/
+
+# Local project documentation (kept on disk, intentionally not versioned)
+/docs/

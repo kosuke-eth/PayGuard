@@ -1,0 +1,26 @@
+{
+  "name": "@payguard/integration",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Public frontend-integration surface: HTTP schemas, public TS models, EIP-712 descriptors, enum conversions. No DB, no chain RPC client, no server secrets — enforced by this package's dependency list containing only @payguard/domain (ARCH 3.1: the future frontend must not import backend private keys, database code or protocol-specific route construction).",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "abi:generate": "tsx scripts/generate-abi.ts"
+  },
+  "dependencies": {
+    "@payguard/domain": "workspace:*"
+  },
+  "devDependencies": {
+    "ajv": "8.20.0",
+    "tsx": "4.23.13",
+    "typescript": "5.9.3",
+    "viem": "2.56.3",
+    "vitest": "5.0.0"
+  }
+}

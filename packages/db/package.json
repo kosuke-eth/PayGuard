@@ -1,0 +1,25 @@
+{
+  "name": "@payguard/db",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "PostgreSQL client wrapper: exact-numeric type parsing, single-connection transaction helper. Domain schema/migrations land in Stage 3.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "migrate": "tsx src/migrate-cli.ts"
+  },
+  "dependencies": {
+    "@payguard/domain": "workspace:*",
+    "pg": "8.20.0"
+  },
+  "devDependencies": {
+    "@types/pg": "8.23.1",
+    "typescript": "5.9.3",
+    "vitest": "5.0.0"
+  }
+}

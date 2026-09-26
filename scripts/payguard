@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# PayGuard repository-local command surface.
+# Per PAYGUARD_BUILD_PROMPTS.md shared execution contract section E:
+#   ./scripts/payguard verify-stage 01..07, then verify-all, preflight, demo, export-integration.
+# Stage 1 implements the dispatcher and verify-stage 01. Every other subcommand below is a
+# deliberate, clearly-labeled failure — not a placeholder success — until its stage lands.
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+# Make locally-installed Foundry and Homebrew PostgreSQL 17 available regardless of the
+# invoking shell's PATH (Stage 1 installed both fresh; see docs/implementation/DEPENDENCIES.md).
+export PATH="$HOME/.foundry/bin:/opt/homebrew/opt/postgresql@17/bin:$PATH"
+
+DATABASE_URL="${DATABASE_URL:-postgresql://payguard:payguard_local_dev@127.0.0.1:5432/payguard_dev}"
+export DATABASE_URL
+
+STEP=""
+fail() {
+  echo ""
+  echo "FAIL: ${STEP}"
+  echo "$1"
+  exit 1
+}
+
+run_step() {
+  STEP="$1"
+  shift
+  echo ""
+  echo "==> ${STEP}"
+  if ! "$@"; then
+    fail "command failed: $*"
+  fi
+}
+
+cmd_db_start() {
+  echo "==> db:start (postgresql@17 via brew services, idempotent)"
+  if ! command -v brew >/dev/null 2>&1; then
+    fail "brew not found; start PostgreSQL 17 by another means and rerun"
+  fi
+  brew services start postgresql@17 >/dev/null 2>&1 || true
+  for _ in $(seq 1 20); do
+    if pg_isready -q 2>/dev/null; then
+      echo "postgresql@17 is accepting connections"
+      return 0
+    fi
+    sleep 0.5
+  done
+  fail "postgresql@17 did not become ready within 10s"
+}
+
+cmd_db_check() {
+  STEP="db:check"
+  if ! pg_isready -q 2>/dev/null; then
+    fail "PostgreSQL is not accepting connections; run './scripts/payguard db:start' first"
+  fi
+  if ! psql "$DATABASE_URL" -c "SELECT 1" >/dev/null 2>&1; then
+    fail "cannot connect with DATABASE_URL=${DATABASE_URL}; create the local dev role/database first (see docs/implementation/DEPENDENCIES.md)"
+  fi
+  echo "PostgreSQL reachable at DATABASE_URL"
+}
+
+cmd_verify_stage_01() {
+  echo "PayGuard verify-stage 01"
+  echo "Node:   $(node -v 2>/dev/null || echo 'NOT FOUND')"
+  echo "pnpm:   $(pnpm -v 2>/dev/null || echo 'NOT FOUND')"
+  echo "forge:  $(forge --version 2>/dev/null | head -1 || echo 'NOT FOUND')"
+  echo "psql:   $(psql --version 2>/dev/null || echo 'NOT FOUND')"
+
+  run_step "pnpm install (reproducible install)" pnpm install --frozen-lockfile
+  run_step "pnpm typecheck (all workspace packages, strict TS)" pnpm typecheck
+  run_step "pnpm lint (biome check)" pnpm lint
+  run_step "pnpm vectors:generate (TS-side EIP-712 vectors, regenerated fresh)" pnpm vectors:generate
+
+  run_step "vitest: packages/domain (schemas + EIP-712 vectors)" pnpm --filter @payguard/domain test
+  run_step "vitest: packages/integration (public-boundary check)" pnpm --filter @payguard/integration test
+  run_step "vitest: packages/chain (real local Anvil connectivity)" pnpm --filter @payguard/chain test
+  run_step "vitest: apps/api (Stage 1 scaffold only)" pnpm --filter @payguard/api test
+  run_step "vitest: apps/worker (Stage 1 scaffold only)" pnpm --filter @payguard/worker test
+
+  cmd_db_start
+  cmd_db_check
+  cmd_db_test_ensure
+  run_step "vitest: packages/db (real local PostgreSQL 17 connectivity + uint256 round-trip, plus Stage 3's payguard_test-backed suite)" pnpm --filter @payguard/db test
+
+  run_step "forge build: contracts/core-v4 (v4-core d153b048, solc 0.8.26, Cancun)" bash -c "cd contracts/core-v4 && forge build"
+  run_step "forge test: contracts/core-v4 (real local v4 exact-output swap + negative case + EIP-712 Solidity vectors)" bash -c "cd contracts/core-v4 && forge test"
+
+  echo ""
+  echo "verify-stage 01: PASS"
+}
+
+cmd_verify_stage_02() {
+  echo "PayGuard verify-stage 02"
+  echo "(entry review: rerun Stage 1's full pipeline first, then Stage 2's vault/authorization-core evidence)"
+
+  cmd_verify_stage_01
+
+  run_step "forge test -vv: contracts/core-v4 full suite (vault, fixtures, invariants, EIP-712 cross-check)" \
+    bash -c "cd contracts/core-v4 && forge test"
+
+  run_step "forge test: PayGuardVault stateful invariant handler (real successes + rejected replay/unauthorized attempts)" \
+    bash -c "cd contracts/core-v4 && forge test --match-path 'test/Invariants.t.sol' -vv"
+
+  run_step "export generated ABI: PayGuardVault (actual compiled artifact, not a hand-written mirror)" \
+    bash -c "mkdir -p docs/implementation/evidence && cp contracts/core-v4/out/PayGuardVault.sol/PayGuardVault.json docs/implementation/evidence/PayGuardVault.abi.json"
+
+  echo ""
+  echo "verify-stage 02: PASS"
+}
+
+cmd_db_test_ensure() {
+  if ! command -v psql >/dev/null 2>&1; then
+    fail "psql not found"
+  fi
+  local exists
+  exists=$(psql -U "$(whoami)" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='payguard_test'" 2>/dev/null || echo "")
+  if [ "$exists" != "1" ]; then
+    psql -U "$(whoami)" -d postgres -c "CREATE DATABASE payguard_test OWNER payguard;" >/dev/null
+    echo "created disposable payguard_test database"
+  else
+    echo "payguard_test database already exists (disposable, local only; its own tests truncate/reset what they need)"
+  fi
+}
+
+cmd_verify_stage_03() {
+  echo "PayGuard verify-stage 03"
+  echo "(entry review: rerun Stage 2's full pipeline first, then Stage 3's database evidence)"
+
+  cmd_verify_stage_02
+
+  run_step "db:test:ensure (provision only a disposable local payguard_test database)" cmd_db_test_ensure
+
+  run_step "pnpm --filter @payguard/db migrate (real migrations, real PostgreSQL, payguard_test)" \
+    bash -c "cd packages/db && DATABASE_URL=postgresql://payguard:payguard_local_dev@127.0.0.1:5432/payguard_test pnpm migrate"
+
+  run_step "pnpm --filter @payguard/db typecheck" pnpm --filter @payguard/db typecheck
+
+  run_step "pnpm --filter @payguard/db test (65 real-PostgreSQL tests: migration reentry, numeric/byte round-trips, immutable evidence, FK/unique/partial-index, CAS conflict, rollback-no-orphan, outbox lease crash/reclaim/fencing, concurrent invoice submission, retry-after-failure, canonical/orphan replay, SPEC-004/deployment-reset gap regressions)" \
+    pnpm --filter @payguard/db test
+
+  echo ""
+  echo "verify-stage 03: PASS"
+}
+
+cmd_verify_stage_04() {
+  echo "PayGuard verify-stage 04"
+  echo "(entry review: rerun Stage 3's full pipeline first, then Stage 4's HTTP control-plane evidence)"
+
+  cmd_verify_stage_03
+
+  run_step "pnpm typecheck (all workspace packages, including apps/api)" pnpm typecheck
+  run_step "pnpm lint (biome check, all workspace packages)" pnpm lint
+
+  run_step "vitest: packages/chain (real local Anvil connectivity, ABI drift, cross-package ABI identity vs @payguard/integration)" \
+    pnpm --filter @payguard/chain test
+  run_step "vitest: packages/integration (public-boundary check, ABI drift, external-consumer smoke test)" \
+    pnpm --filter @payguard/integration test
+
+  run_step "vitest: apps/api (real Postgres + real deployed local PayGuardVault via Anvil: SIWE auth, vault ownership/pagination, wire-width/schema strictness, prepared owner calldata executed on-chain with real receipts, policy draft races + immutable compile round-trips, chain-observation hint boundary, invoice/intent duplicate-identity idempotency, ALLOW/ESCALATE/BLOCK/UNKNOWN decisions against the real vault, read-only approval generation, mutated-approval rejection, durable queued submission, role-scoped payment reads, and OpenAPI/contract drift)" \
+    pnpm --filter @payguard/api test
+
+  echo ""
+  echo "verify-stage 04: PASS"
+}
+
+cmd_verify_stage_05() {
+  echo "PayGuard verify-stage 05"
+  echo "(entry review: rerun Stage 4's full pipeline first, then Stage 5's worker/recovery/failure-injection evidence)"
+
+  cmd_verify_stage_04
+
+  mkdir -p docs/implementation/evidence/stage05
+
+  run_step "pnpm typecheck (all workspace packages, including apps/worker)" pnpm typecheck
+  run_step "pnpm lint (biome check, all workspace packages)" pnpm lint
+
+  run_step "vitest: packages/db (state-transition graphs, txJournal, indexing/reorg regressions, heartbeat)" \
+    pnpm --filter @payguard/db test
+
+  # apps/worker and apps/api each spawn their own real local Anvil per test file and share the
+  # real payguard_test Postgres database -- run sequentially, never concurrently (SPEC-lesson from
+  # this stage's own implementation: concurrent suites truncating the shared test DB produce
+  # misleading FK/unique-constraint failures that are not real bugs).
+  run_step "vitest: apps/worker (real Anvil + real Postgres: relayer sign/broadcast/verify, real ALLOW settlement + redelivery-never-pays-twice, real BLOCK/ESCALATE-with-owner-approval scenarios, real multi-block anvil_reorg regression + forward-indexing idempotent replay, and the full required failure-injection matrix) -- output saved to docs/implementation/evidence/stage05/worker-test-output.txt" \
+    bash -c "pnpm --filter @payguard/worker test 2>&1 | tee docs/implementation/evidence/stage05/worker-test-output.txt"
+
+  run_step "vitest: apps/api (adds Stage 5's health.ready worker-heartbeat/relayer-balance wiring, and the full public-API payment demonstration: real SIWE HTTP login -> POST /v1/invoices -> POST /v1/payment-intents -> POST .../submit -> the real @payguard/worker handler settles it on-chain -> authenticated GET /v1/payments/{id} reads the receipt-backed result, independently re-verified on-chain) -- output saved to docs/implementation/evidence/stage05/api-test-output.txt" \
+    bash -c "pnpm --filter @payguard/api test 2>&1 | tee docs/implementation/evidence/stage05/api-test-output.txt"
+
+  run_step "extract real direct-payment receipt/settlement evidence from the saved test output" bash -c "
+    {
+      echo '# Stage 5 direct-payment receipt and settlement evidence (extracted from real test runs)'
+      echo
+      echo '## Full public-API demonstration (apps/api/test/publicApiPaymentDemo.test.ts)'
+      grep -B1 -A1 'Full public-API payment demonstration' docs/implementation/evidence/stage05/api-test-output.txt || true
+      echo
+      echo '## Real ALLOW settlement + fault-injection scenario names (apps/worker)'
+      grep -E '✓|✗|×' docs/implementation/evidence/stage05/worker-test-output.txt || true
+      echo
+      echo '## Final tallies'
+      grep -E 'Test Files|Tests ' docs/implementation/evidence/stage05/worker-test-output.txt || true
+      grep -E 'Test Files|Tests ' docs/implementation/evidence/stage05/api-test-output.txt || true
+    } > docs/implementation/evidence/stage05/receipts-and-fault-results.md
+  "
+
+  echo ""
+  echo "verify-stage 05: PASS"
+  echo "Evidence saved under docs/implementation/evidence/stage05/"
+}
+
+cmd_not_yet() {
+  local stage="$1"
+  echo "FAIL: '$2' is not implemented yet."
+  echo "It is built in Stage ${stage} per PAYGUARD_BUILD_PROMPTS.md. Only Stages 1-5 (verify-stage 01..05) exist so far."
+  exit 1
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    verify-stage)
+      local stage="${2:-}"
+      case "$stage" in
+        01|1) cmd_verify_stage_01 ;;
+        02|2) cmd_verify_stage_02 ;;
+        03|3) cmd_verify_stage_03 ;;
+        04|4) cmd_verify_stage_04 ;;
+        05|5) cmd_verify_stage_05 ;;
+        06|6) cmd_not_yet 6 "verify-stage 06" ;;
+        07|7) cmd_not_yet 7 "verify-stage 07" ;;
+        *)
+          echo "usage: $0 verify-stage <01-07>" >&2
+          exit 1
+          ;;
+      esac
+      ;;
+    verify-all) cmd_not_yet 7 "verify-all" ;;
+    preflight) cmd_not_yet 7 "preflight" ;;
+    demo) cmd_not_yet 7 "demo" ;;
+    export-integration) cmd_not_yet 7 "export-integration" ;;
+    db:start) cmd_db_start ;;
+    db:check) cmd_db_check ;;
+    *)
+      echo "usage: $0 {verify-stage <01-07>|verify-all|preflight|demo|export-integration|db:start|db:check}" >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

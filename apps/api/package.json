@@ -1,0 +1,32 @@
+{
+  "name": "@payguard/api",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "PayGuard Fastify API process. Stage 4: authenticated HTTP control plane over the Stage 3 database and Stage 2 vault.",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "dev": "tsx watch src/main.ts",
+    "openapi:generate": "tsx scripts/generate-openapi.ts"
+  },
+  "dependencies": {
+    "@payguard/chain": "workspace:*",
+    "@payguard/db": "workspace:*",
+    "@payguard/domain": "workspace:*",
+    "fastify": "5.12.1",
+    "pg": "8.20.0",
+    "viem": "2.56.3"
+  },
+  "devDependencies": {
+    "@payguard/integration": "workspace:*",
+    "@payguard/test-utils": "workspace:*",
+    "@payguard/worker": "workspace:*",
+    "@types/pg": "8.23.1",
+    "ajv": "8.20.0",
+    "tsx": "4.23.13",
+    "typescript": "5.9.3",
+    "vitest": "5.0.0"
+  }
+}

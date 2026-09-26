@@ -1,0 +1,27 @@
+{
+  "name": "@payguard/worker",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "PayGuard durable worker process (outbox, relayer, indexer). Stage 5: real handlers.",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "dev": "tsx watch src/main.ts"
+  },
+  "dependencies": {
+    "@payguard/chain": "workspace:*",
+    "@payguard/db": "workspace:*",
+    "@payguard/domain": "workspace:*",
+    "pg": "8.20.0",
+    "viem": "2.56.3"
+  },
+  "devDependencies": {
+    "@payguard/test-utils": "workspace:*",
+    "@types/pg": "8.23.1",
+    "tsx": "4.23.13",
+    "typescript": "5.9.3",
+    "vitest": "5.0.0"
+  }
+}
