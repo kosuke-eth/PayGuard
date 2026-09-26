@@ -490,3 +490,194 @@ export async function markSiblingAttemptsReplaced(
   );
   return result.rows.map(mapAttemptRow);
 }
+
+// --- SPEC-037: signer nonce reconciliation after a reorg orphans a broadcast attempt -----------
+//
+// The gap: a reorg can orphan the block a WINNING attempt was closed against. Reorg regression
+// (indexer.ts's `regressAffectedPayments`/`reorgToBlock`) correctly un-cans the PAYMENT's own
+// state, but nothing previously touched `signer_state.next_nonce` or the orphaned family's
+// `closed_at`/`canonical_tx_hash` -- `next_nonce` already counted that nonce as consumed at
+// reservation time, so every later reservation for this sender allocates a nonce the live chain
+// does not actually expect next, and every subsequent broadcast stalls in the mempool forever.
+//
+// The fix does NOT blindly lower `next_nonce`, and does NOT assume
+// `max(chainNonce, dbNonce)` repairs anything -- both would risk colliding with a family that is
+// still legitimately reserved-but-unsigned/unsigned-but-unbroadcast for a HIGHER nonce, or
+// silently reusing a nonce whose payment is already correctly settled through a different attempt.
+// Instead: for every nonce strictly between the chain's real next nonce and our belief, identify
+// the SPECIFIC family that owns it and reconcile it individually against real evidence.
+
+export interface NonceReconciliationResult {
+  /** Nonce families reopened (closed_at/canonical_tx_hash cleared) so existing recovery -- never a
+   * fresh reservation -- resumes them at their own already-owned nonce. */
+  reopenedFamilyIds: string[];
+  /** Nonces in the gap that could NOT be safely reconciled (ambiguous: the underlying payment is
+   * already canonically settled through a different attempt, so reusing/reopening this nonce would
+   * risk a second business payment). Allocation for this sender is refused while any remain. */
+  blockedNonces: bigint[];
+}
+
+/**
+ * Senders with at least one CLOSED nonce family whose `canonical_tx_hash` was receipted inside one
+ * of the just-orphaned blocks -- the exact precondition for a SPEC-037 gap. Called with the
+ * orphaned block hashes BEFORE `reorgToBlock` flips their `chain_blocks.canonical` flag (the flag
+ * itself is irrelevant here; `receipts.block_hash` membership is what matters and survives the
+ * flip either way, but keeping the check anchored to the caller's own orphaned-set keeps this
+ * function's answer independent of exactly when it runs relative to the flip).
+ */
+export async function getSendersWithFamiliesClosedInBlocks(
+  db: Queryable,
+  params: { deploymentId: string; blockHashes: Buffer[] },
+): Promise<Buffer[]> {
+  if (params.blockHashes.length === 0) return [];
+  const result = await db.query(
+    `SELECT DISTINCT nf.sender
+     FROM nonce_families nf
+     JOIN receipts r ON r.deployment_id = nf.deployment_id AND r.tx_hash = nf.canonical_tx_hash
+     WHERE nf.deployment_id = $1 AND nf.closed_at IS NOT NULL AND r.block_hash = ANY($2::bytea[])`,
+    [params.deploymentId, params.blockHashes],
+  );
+  return result.rows.map((row) => row.sender as Buffer);
+}
+
+/**
+ * Reconciles ONE sender's nonce bookkeeping against a live-chain ground truth the caller already
+ * observed via `eth_getTransactionCount(sender, 'latest')` (an RPC call, so it happens OUTSIDE any
+ * SQL transaction -- CLAUDE.md: never hold a transaction across an RPC round trip -- and its result
+ * is passed in here as `liveTransactionCount`). Must run under the signer's row lock (`lockSigner`)
+ * in the SAME transaction as any other nonce-affecting write, to serialize against a concurrent
+ * fresh reservation.
+ */
+export async function reconcileSignerNonceAfterReorg(
+  client: pg.PoolClient,
+  params: { deploymentId: string; sender: Buffer; liveTransactionCount: bigint },
+): Promise<NonceReconciliationResult> {
+  const signerState = await client.query<{ next_nonce: string }>(
+    `SELECT next_nonce FROM signer_state WHERE deployment_id = $1 AND sender = $2 FOR UPDATE`,
+    [params.deploymentId, params.sender],
+  );
+  const nextNonceRow = signerState.rows[0];
+  if (!nextNonceRow) {
+    // No reservation has ever happened for this sender -- nothing to reconcile.
+    return { reopenedFamilyIds: [], blockedNonces: [] };
+  }
+  const dbNextNonce = BigInt(nextNonceRow.next_nonce);
+  if (params.liveTransactionCount >= dbNextNonce) {
+    // The chain already agrees with (or exceeds, e.g. non-worker activity on this address) our
+    // belief -- no gap.
+    return { reopenedFamilyIds: [], blockedNonces: [] };
+  }
+
+  const reopenedFamilyIds: string[] = [];
+  const blockedNonces: bigint[] = [];
+
+  for (let nonce = params.liveTransactionCount; nonce < dbNextNonce; nonce += 1n) {
+    const familyResult = await client.query(
+      'SELECT * FROM nonce_families WHERE deployment_id = $1 AND sender = $2 AND nonce = $3',
+      [params.deploymentId, params.sender, nonce.toString(10)],
+    );
+    const familyRow = familyResult.rows[0];
+    if (!familyRow) {
+      // Should not happen (reserveNonceFamily always inserts the family it just counted) -- treat
+      // as unresolvable rather than guess.
+      blockedNonces.push(nonce);
+      continue;
+    }
+    const family = mapNonceFamilyRow(familyRow);
+    if (!family.closedAt) {
+      // Never closed by us -- already exactly what the existing SIGNED-not-broadcast /
+      // reserved-but-unsigned recovery paths already handle unmodified. Not a SPEC-037 case.
+      continue;
+    }
+
+    // Is this family's payment ALREADY canonically settled through a DIFFERENT attempt (a
+    // different nonce family for the same payment, e.g. after a legitimate re-versioning)? If so,
+    // reopening this one and letting the worker resume it would risk a second real payment for the
+    // same invoice -- refuse instead (CLAUDE.md: never double-pay one invoice).
+    const alreadySettledElsewhere = await client.query(
+      `SELECT 1
+       FROM transaction_attempts ta2
+       JOIN nonce_families nf2 ON nf2.id = ta2.nonce_family_id
+       JOIN payment_intents pi2 ON pi2.id = nf2.intent_id
+       JOIN payment_intents pi1 ON pi1.id = $3
+       WHERE pi2.payment_id = pi1.payment_id
+         AND nf2.id <> $1
+         AND ta2.state = 'SUCCEEDED'
+         AND EXISTS (
+           SELECT 1 FROM receipts r
+           WHERE r.deployment_id = $2 AND r.tx_hash = ta2.tx_hash AND r.canonical = true
+         )
+       LIMIT 1`,
+      [family.id, params.deploymentId, family.intentId],
+    );
+    if (alreadySettledElsewhere.rows[0]) {
+      blockedNonces.push(nonce);
+      continue;
+    }
+
+    // Safe to reopen: reuse this SAME known, already-signed transaction identity (nonce, raw
+    // bytes) rather than allocate a new one. The orphaned attempt itself walks
+    // SUCCEEDED/REVERTED -> REORGED -> UNKNOWN -> SUBMITTED (every edge already legal in
+    // TRANSACTION_ATTEMPT_STATE_GRAPH; the first hop is the same one payments.executionStatus
+    // takes on reorg). Landing on SUBMITTED -- not UNKNOWN -- means `submitPayment.ts`'s existing
+    // `broadcastAttempt` (which already rebroadcasts SIGNED/SUBMITTED attempts, idempotently, via
+    // the exact persisted raw bytes) picks this back up unmodified; UNKNOWN's own meaning
+    // elsewhere (an indeterminate broadcast RESULT, not a resumable-after-reorg attempt) is
+    // deliberately left untouched.
+    const attempts = await client.query<{ id: string; state: TransactionAttemptState }>(
+      'SELECT id, state FROM transaction_attempts WHERE nonce_family_id = $1 AND tx_hash = $2',
+      [family.id, family.canonicalTxHash],
+    );
+    for (const attempt of attempts.rows) {
+      if (attempt.state === 'SUCCEEDED' || attempt.state === 'REVERTED') {
+        for (const next of ['REORGED', 'UNKNOWN', 'SUBMITTED'] as const) {
+          await client.query('UPDATE transaction_attempts SET state = $2 WHERE id = $1', [
+            attempt.id,
+            next,
+          ]);
+        }
+      }
+    }
+    await client.query(
+      'UPDATE nonce_families SET closed_at = NULL, canonical_tx_hash = NULL WHERE id = $1',
+      [family.id],
+    );
+    reopenedFamilyIds.push(family.id);
+  }
+
+  return { reopenedFamilyIds, blockedNonces };
+}
+
+/**
+ * True while ANY nonce for this sender is in the unresolved SPEC-037 "blocked" state (recorded by
+ * the caller after `reconcileSignerNonceAfterReorg` -- this function itself holds no additional
+ * state; it re-derives the answer from the same evidence so it can never drift from the
+ * reconciliation that produced it). `reserveNonceFamily` must never be called for a sender while
+ * this is true: a fresh reservation would allocate a nonce ABOVE the unresolved gap, and the chain
+ * will refuse it until the gap nonce is filled by something -- silently reserving anyway would
+ * just grow the backlog instead of surfacing it.
+ */
+export async function hasUnresolvedNonceGap(
+  db: Queryable,
+  params: { deploymentId: string; sender: Buffer; liveTransactionCount: bigint },
+): Promise<boolean> {
+  const signerState = await db.query<{ next_nonce: string }>(
+    'SELECT next_nonce FROM signer_state WHERE deployment_id = $1 AND sender = $2',
+    [params.deploymentId, params.sender],
+  );
+  const row = signerState.rows[0];
+  if (!row) return false;
+  const dbNextNonce = BigInt(row.next_nonce);
+  if (params.liveTransactionCount >= dbNextNonce) return false;
+  // A gap still exists if any nonce in range is still owned by a CLOSED family (unreconciled) --
+  // an OPEN family in the gap is normal in-flight state, not a blocked gap.
+  const result = await db.query(
+    `SELECT 1 FROM nonce_families
+     WHERE deployment_id = $1 AND sender = $2
+       AND nonce >= $3 AND nonce < $4
+       AND closed_at IS NOT NULL
+     LIMIT 1`,
+    [params.deploymentId, params.sender, params.liveTransactionCount.toString(10), row.next_nonce],
+  );
+  return result.rows.length > 0;
+}

@@ -61,6 +61,25 @@ function required(env: NodeJS.ProcessEnv, name: string): string {
   return value;
 }
 
+/** Strict positive-integer parse -- never silently coerces to NaN/0 (mirrors apps/api/src/config.ts). */
+function optionalInt(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const raw = env[name];
+  if (raw === undefined) return fallback;
+  if (!/^[0-9]+$/.test(raw) || Number.parseInt(raw, 10) <= 0) {
+    throw new Error(`invalid environment variable ${name}: expected a positive integer, got "${raw}"`);
+  }
+  return Number.parseInt(raw, 10);
+}
+
+/** Strict BigInt parse (CHAIN_ID) -- BigInt() on garbage input throws an unlabeled SyntaxError. */
+function optionalBigInt(env: NodeJS.ProcessEnv, name: string, fallback: string): bigint {
+  const raw = env[name] ?? fallback;
+  if (!/^[0-9]+$/.test(raw)) {
+    throw new Error(`invalid environment variable ${name}: expected a non-negative integer, got "${raw}"`);
+  }
+  return BigInt(raw);
+}
+
 export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerConfig {
   assertNoOwnerKeyConfigured(env);
   const relayerPrivateKey = required(env, 'RELAYER_PRIVATE_KEY') as Hex;
@@ -80,15 +99,15 @@ export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerCo
   return {
     databaseUrl: required(env, 'DATABASE_URL'),
     rpcUrl: env.RPC_URL ?? 'http://127.0.0.1:8545',
-    chainId: BigInt(env.CHAIN_ID ?? '31337'),
+    chainId: optionalBigInt(env, 'CHAIN_ID', '31337'),
     deploymentId: required(env, 'PAYGUARD_DEPLOYMENT_ID'),
     relayerPrivateKey,
     workerId,
-    leaseDurationSeconds: Number.parseInt(env.WORKER_LEASE_SECONDS ?? '60', 10),
-    pollIntervalMs: Number.parseInt(env.WORKER_POLL_INTERVAL_MS ?? '500', 10),
-    heartbeatIntervalMs: Number.parseInt(env.WORKER_HEARTBEAT_INTERVAL_MS ?? '5000', 10),
-    receiptPollAttempts: Number.parseInt(env.WORKER_RECEIPT_POLL_ATTEMPTS ?? '10', 10),
-    receiptPollIntervalMs: Number.parseInt(env.WORKER_RECEIPT_POLL_INTERVAL_MS ?? '250', 10),
-    indexerBatchBlocks: BigInt(env.WORKER_INDEXER_BATCH_BLOCKS ?? '500'),
+    leaseDurationSeconds: optionalInt(env, 'WORKER_LEASE_SECONDS', 60),
+    pollIntervalMs: optionalInt(env, 'WORKER_POLL_INTERVAL_MS', 500),
+    heartbeatIntervalMs: optionalInt(env, 'WORKER_HEARTBEAT_INTERVAL_MS', 5000),
+    receiptPollAttempts: optionalInt(env, 'WORKER_RECEIPT_POLL_ATTEMPTS', 10),
+    receiptPollIntervalMs: optionalInt(env, 'WORKER_RECEIPT_POLL_INTERVAL_MS', 250),
+    indexerBatchBlocks: optionalBigInt(env, 'WORKER_INDEXER_BATCH_BLOCKS', '500'),
   };
 }

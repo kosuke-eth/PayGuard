@@ -7,7 +7,7 @@
  * diverged there, and never accumulated more than the seed orphaned hash) before this test forced a
  * real multi-block reorg through it.
  */
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { createLocalPublicClient } from '@payguard/chain';
 import { getCursor, getOutboxById, getPaymentById } from '@payguard/db';
 import { RELAYER_PRIVATE_KEY } from '@payguard/test-utils';
@@ -202,5 +202,131 @@ describe('runIndexerTick: real reorg regression', () => {
     expect(`0x${cursorAfter!.lastCanonicalHash!.toString('hex')}`.toLowerCase()).toBe(
       ancestorOnChain.hash.toLowerCase(),
     );
+  }, 45_000);
+
+  it('SPEC-037: after a reorg orphans a settled attempt, a LATER payment from the SAME relayer still actually settles -- the nonce gap does not stall it forever', async () => {
+    const first = await seedAllowedPayment(harness);
+    const { jobId: firstJobId } = await seedSubmission(harness, {
+      paymentId: first.paymentId,
+      intentId: first.intentId,
+      ownerWalletId: first.ownerWalletId,
+    });
+    const submitDeps = submitDepsFor(harness);
+    await driveJobToCompletion(harness, submitDeps, firstJobId);
+    const firstSettled = await getPaymentById(harness.pool, first.paymentId);
+    expect(firstSettled!.executionStatus).toBe('SUCCEEDED');
+
+    const deps = indexerDepsFor(harness);
+    await tickUntilCaughtUp(deps);
+
+    // Real reorg orphans the FIRST payment's settlement block -- exactly the SPEC-037
+    // precondition: `signer_state.next_nonce` already counted that nonce, but the live chain no
+    // longer shows it as mined.
+    await anvilReorg(harness.fixture.rpcUrl, 3);
+    await tickUntilCaughtUp(deps); // regression + SPEC-037 reconciliation both run inside this tick
+
+    const relayerAddress = submitDeps.signer.address;
+    const liveCountAfterReorg = await deps.publicClient.getTransactionCount({
+      address: relayerAddress,
+      blockTag: 'latest',
+    });
+
+    // A SECOND, entirely independent payment from the SAME relayer. Before the SPEC-037 fix, its
+    // fresh nonce reservation would sit one nonce ABOVE the gap the reorg left behind and the
+    // resulting transaction would stall in the mempool forever (reproduced directly per
+    // DECISIONS.md SPEC-037) -- `driveJobToCompletion`'s bounded retry loop would time out with
+    // the job stuck, never reaching DONE.
+    const second = await seedAllowedPayment(harness);
+    const { jobId: secondJobId } = await seedSubmission(harness, {
+      paymentId: second.paymentId,
+      intentId: second.intentId,
+      ownerWalletId: second.ownerWalletId,
+    });
+    await driveJobToCompletion(harness, submitDeps, secondJobId);
+
+    const secondSettled = await getPaymentById(harness.pool, second.paymentId);
+    expect(secondSettled!.executionStatus).toBe('SUCCEEDED');
+    expect(secondSettled!.confidence).toBe('LOCAL_DEMO');
+
+    // The gap nonce itself was genuinely refilled (by the reorg tick's own rebroadcast of the
+    // first attempt's persisted raw bytes), not silently skipped -- the relayer's live tx count
+    // has caught back up to (at least) where it was consuming nonces before the reorg.
+    const finalCount = await deps.publicClient.getTransactionCount({
+      address: relayerAddress,
+      blockTag: 'latest',
+    });
+    expect(finalCount).toBeGreaterThan(liveCountAfterReorg);
+  }, 60_000);
+
+  it('SPEC-037: a nonce gap whose payment is ALREADY canonically settled through a DIFFERENT attempt is refused, not silently reopened (never a second business payment)', async () => {
+    const seeded = await seedAllowedPayment(harness);
+    const { jobId } = await seedSubmission(harness, {
+      paymentId: seeded.paymentId,
+      intentId: seeded.intentId,
+      ownerWalletId: seeded.ownerWalletId,
+    });
+    const submitDeps = submitDepsFor(harness);
+    await driveJobToCompletion(harness, submitDeps, jobId);
+    const settled = await getPaymentById(harness.pool, seeded.paymentId);
+    expect(settled!.executionStatus).toBe('SUCCEEDED');
+
+    const deps = indexerDepsFor(harness);
+    await tickUntilCaughtUp(deps);
+
+    const family = await harness.pool.query(
+      'SELECT id, sender, canonical_tx_hash FROM nonce_families WHERE intent_id = $1',
+      [seeded.intentId],
+    );
+    const familyRow = family.rows[0];
+    const sender = familyRow.sender as Buffer;
+
+    // Fabricate the "already settled through a different attempt" precondition directly: a SECOND
+    // nonce family + SUCCEEDED attempt for the SAME payment (as a legitimate re-versioning would
+    // produce), with a real canonical receipt of its own -- BEFORE the reorg orphans the first one.
+    // Reuses an ALREADY-canonical, ALREADY-real chain_blocks row (the settlement's own observed
+    // block) rather than fabricating a block at a height that doesn't exist on the live chain --
+    // runIndexerTick's own reorg-detection reads `getMaxCanonicalBlock` and re-fetches it by
+    // number from the real chain, so a fake height would break detection itself, not just this
+    // fixture.
+    const otherTxHash = Buffer.from(randomBytes(32));
+    const existingBlock = await harness.pool.query(
+      'SELECT block_hash FROM chain_blocks WHERE deployment_id = $1 AND canonical = true ORDER BY block_number ASC LIMIT 1',
+      [harness.deploymentId],
+    );
+    const otherBlockHash = existingBlock.rows[0].block_hash as Buffer;
+    await harness.pool.query(
+      `INSERT INTO receipts (deployment_id, tx_hash, block_hash, receipt_status, canonical, raw_receipt)
+       VALUES ($1,$2,$3,1,true,'{}')`,
+      [harness.deploymentId, otherTxHash, otherBlockHash],
+    );
+    const otherFamily = await harness.pool.query(
+      `INSERT INTO nonce_families (id, deployment_id, sender, nonce, intent_id, unsigned_request, expected_to, expected_calldata_hash, canonical_tx_hash, closed_at)
+       VALUES (gen_random_uuid(),$1,$2,999999,$3,'{}',$4,$5,$6,now()) RETURNING id`,
+      [
+        harness.deploymentId,
+        sender,
+        seeded.intentId,
+        Buffer.from(harness.fixture.vaultAddress.slice(2), 'hex'),
+        Buffer.alloc(32, 1),
+        otherTxHash,
+      ],
+    );
+    await harness.pool.query(
+      `INSERT INTO transaction_attempts (id, deployment_id, nonce_family_id, tx_hash, raw_signed_transaction, state)
+       VALUES (gen_random_uuid(),$1,$2,$3,'\\x02','SUCCEEDED')`,
+      [harness.deploymentId, otherFamily.rows[0].id, otherTxHash],
+    );
+
+    await anvilReorg(harness.fixture.rpcUrl, 3);
+    await tickUntilCaughtUp(deps);
+
+    // The ORIGINAL family must NOT have been reopened -- it stays closed, exactly as reorgToBlock
+    // + the SPEC-037 reconciliation left it, since reopening it would risk a second real payment
+    // for an invoice that is already correctly settled through the fabricated "other" attempt.
+    const afterReorg = await harness.pool.query(
+      'SELECT closed_at FROM nonce_families WHERE id = $1',
+      [familyRow.id],
+    );
+    expect(afterReorg.rows[0].closed_at).not.toBeNull();
   }, 45_000);
 });

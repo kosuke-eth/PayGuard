@@ -19,7 +19,10 @@ import {
   getMaxCanonicalBlock,
   getPaymentById,
   getPaymentsAffectedByOrphanedBlocks,
+  getSendersWithFamiliesClosedInBlocks,
   isReconciliationTransitionAllowed,
+  lockSigner,
+  reconcileSignerNonceAfterReorg,
   recordBlock,
   recordEvent,
   reorgToBlock,
@@ -172,6 +175,25 @@ export async function runIndexerTick(
         maxKnown.blockNumber,
       );
       const newCanonical = await deps.publicClient.getBlock({ blockNumber: ancestorNumber });
+
+      // SPEC-037: identify senders whose CLOSED nonce family lived in one of the just-orphaned
+      // blocks, and read each one's REAL live nonce count now, BEFORE opening the write
+      // transaction below -- an RPC call must never happen inside a held SQL transaction.
+      const affectedSenders = await getSendersWithFamiliesClosedInBlocks(deps.pool, {
+        deploymentId: deps.deploymentId,
+        blockHashes: orphaned,
+      });
+      const liveTransactionCounts = new Map<string, bigint>();
+      for (const sender of affectedSenders) {
+        const address = `0x${sender.toString('hex')}` as Address;
+        const count = await deps.publicClient.getTransactionCount({
+          address,
+          blockTag: 'latest',
+        });
+        liveTransactionCounts.set(sender.toString('hex'), BigInt(count));
+      }
+
+      const reopenedFamilyIds: string[] = [];
       await withTransaction(deps.pool, async (client) => {
         await regressAffectedPayments(client, {
           deploymentId: deps.deploymentId,
@@ -182,6 +204,20 @@ export async function runIndexerTick(
           orphanedBlockHashes: orphaned,
           newCanonicalBlockHash: hexToBuffer(newCanonical.hash),
         });
+        // Runs AFTER reorgToBlock has flipped canonicality, so "is this payment already settled
+        // through a DIFFERENT attempt" checks a receipts view that already reflects the new
+        // canonical chain -- not stale pre-reorg canonicality.
+        for (const sender of affectedSenders) {
+          const liveTransactionCount = liveTransactionCounts.get(sender.toString('hex'));
+          if (liveTransactionCount === undefined) continue;
+          await lockSigner(client, { deploymentId: deps.deploymentId, sender });
+          const result = await reconcileSignerNonceAfterReorg(client, {
+            deploymentId: deps.deploymentId,
+            sender,
+            liveTransactionCount,
+          });
+          reopenedFamilyIds.push(...result.reopenedFamilyIds);
+        }
         await advanceCursor(client, {
           deploymentId: deps.deploymentId,
           contractGroup: CONTRACT_GROUP,
@@ -190,6 +226,37 @@ export async function runIndexerTick(
           expectedLeaseVersion: leaseVersion,
         });
       });
+
+      // SPEC-037: immediately refill each reopened family's nonce on-chain by rebroadcasting its
+      // EXACT already-signed bytes (never re-signed) -- outside the transaction just committed,
+      // since this is an RPC call. Without this, the nonce stays genuinely unfilled on the live
+      // chain until something else happens to re-dispatch that specific job, and every OTHER
+      // reservation for this sender in the meantime would stall behind it. Tolerates the same
+      // "already known"/"nonce too low" responses `submitPayment.ts`'s own broadcastAttempt does --
+      // both mean the bytes are already accepted somewhere, not that this call failed.
+      for (const familyId of reopenedFamilyIds) {
+        const attemptResult = await deps.pool.query(
+          "SELECT raw_signed_transaction FROM transaction_attempts WHERE nonce_family_id = $1 AND state = 'SUBMITTED' ORDER BY created_at DESC LIMIT 1",
+          [familyId],
+        );
+        const raw = attemptResult.rows[0]?.raw_signed_transaction as Buffer | undefined;
+        if (!raw) continue;
+        try {
+          await deps.publicClient.sendRawTransaction({
+            serializedTransaction: `0x${raw.toString('hex')}` as `0x02${string}`,
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message.toLowerCase() : String(error);
+          if (
+            !message.includes('already known') &&
+            !message.includes('nonce too low') &&
+            !message.includes('replacement transaction underpriced')
+          ) {
+            throw error;
+          }
+        }
+      }
+
       return { processedThrough: null }; // let the next tick resume forward from the corrected cursor
     }
   }

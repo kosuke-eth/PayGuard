@@ -24,6 +24,7 @@ import {
   getOpenNonceFamilyForIntent,
   getOperationById,
   getPaymentById,
+  hasUnresolvedNonceGap,
   insertTimelineEvent,
   isExecutionStatusTransitionAllowed,
   isOperationStatusTransitionAllowed,
@@ -312,6 +313,30 @@ export async function handlePaymentSubmissionJob(
     to: prepared.to,
     data: prepared.data,
   });
+
+  // SPEC-037: refuse a FRESH nonce reservation while this signer has an unresolved gap left by a
+  // reorg-orphaned attempt whose payment could not be safely resumed (already canonically settled
+  // through a different attempt -- see `reconcileSignerNonceAfterReorg`). Reserving anyway would
+  // allocate a nonce ABOVE the gap that the live chain will refuse until the gap nonce is filled,
+  // silently growing the backlog instead of surfacing it. This is an RPC read, done here (before
+  // opening the write transaction below), never inside one.
+  const liveTransactionCount = BigInt(
+    await deps.publicClient.getTransactionCount({
+      address: deps.signer.address,
+      blockTag: 'latest',
+    }),
+  );
+  const gapUnresolved = await hasUnresolvedNonceGap(deps.pool, {
+    deploymentId: bundle.deploymentId,
+    sender: addressToBuffer(deps.signer.address),
+    liveTransactionCount,
+  });
+  if (gapUnresolved) {
+    return {
+      kind: 'RETRY',
+      reason: 'nonce gap unresolved for this signer (SPEC-037) -- blocked pending resolution',
+    };
+  }
 
   const { family, attempt } = await withTransaction(deps.pool, async (client) => {
     await lockSigner(client, {

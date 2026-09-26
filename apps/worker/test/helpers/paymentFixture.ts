@@ -111,12 +111,18 @@ export async function seedOwnerVault(
     if (existing.rows[0]) {
       return { vaultId: existing.rows[0].id as string, ownerWalletId: owner.id };
     }
+    // B1 (INT-006): record the vault's REAL deployed code hash, not a placeholder -- health.ts's
+    // `vaultCode` readiness check compares live `getCode` against exactly this stored value.
+    const deployedCode = await harness.fixture.publicClient.getCode({
+      address: harness.fixture.vaultAddress,
+    });
+    if (!deployedCode) throw new Error('seedOwnerVault: no code observed at vault address');
     const vault = await createVault(client, {
       id: uuid(),
       deploymentId: harness.deploymentId,
       ownerWalletId: owner.id,
       address: addressBytes,
-      runtimeCodeHash: Buffer.from(keccak256('0x726f757465').slice(2), 'hex'),
+      runtimeCodeHash: Buffer.from(keccak256(deployedCode).slice(2), 'hex'),
       abiSchemaVersion: '1',
     });
     return { vaultId: vault.id, ownerWalletId: owner.id };
