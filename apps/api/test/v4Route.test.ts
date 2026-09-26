@@ -82,7 +82,7 @@ beforeAll(async () => {
           {
             routeId: fixture.v4RouteId,
             adapter: fixture.v4AdapterAddress,
-            kind: 'V4',
+            kind: 'UNISWAP_V4',
             inputToken: fixture.rwaAddress,
             outputToken: fixture.usdcAddress,
             subsidyModes: ['NONE'],

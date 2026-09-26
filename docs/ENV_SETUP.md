@@ -15,11 +15,50 @@ anvil                              # separate terminal: local chain on :8545 (fr
 
 pnpm --filter @payguard/api dev    # starts the API (apps/api, tsx watch src/main.ts)
 pnpm --filter @payguard/worker dev # starts the worker (apps/worker, separate terminal)
+
+cp apps/web/.env.example apps/web/.env
+pnpm --filter @payguard/web dev    # owner control panel at http://localhost:5173
 ```
 
-`.env` is read by `apps/api/src/config.ts` (`loadConfig`) and `apps/worker/src/config.ts`
-(`loadWorkerConfig`) via `process.env` -- both fail fast on a missing/invalid required variable,
-naming exactly which one.
+The API (`apps/api/src/main.ts`), worker (`apps/worker/src/main.ts`), database migrate CLI, and
+`demo-setup` / `demo-reset` load the repository-root `.env` when that file exists. A variable
+already set in the shell is left unchanged. `loadConfig` / `loadWorkerConfig` still read
+`process.env` and fail fast on a missing or invalid required variable, naming exactly which one.
+
+`PAYGUARD_DEPLOYMENT_ID` stays `VALUE_REQUIRED_FROM_USER` until `demo:setup` prints a real id.
+Paste that id into `.env` before starting the API and worker.
+
+`apps/web` is the owner control panel. `.env.example` sets SIWE to `http://localhost:5173`.
+Open that exact origin in the browser (`127.0.0.1` will not match the SIWE domain).
+
+On Windows, `./scripts/payguard` is bash and `db:start` expects Homebrew PostgreSQL. From
+PowerShell, install PostgreSQL 17 and Foundry yourself, create the local role and databases,
+then run the same `pnpm --filter ...` commands. `demo:setup` directly:
+
+```bash
+pnpm --filter @payguard/api exec tsx scripts/demo-setup.ts
+```
+
+```sql
+CREATE USER payguard WITH PASSWORD 'payguard_local_dev';
+CREATE DATABASE payguard_dev OWNER payguard;
+CREATE DATABASE payguard_test OWNER payguard;
+```
+
+## Supabase
+
+The API and worker talk to Postgres through `DATABASE_URL`. Supabase is that database: the
+browser never receives a Supabase key. Ask for a project, then for **Project Settings → Database
+→ Connection string → URI** (direct connection, or the session pooler on port 5432). Append
+`?sslmode=require` and put that string in `DATABASE_URL`.
+
+Do not use the transaction pooler (port 6543). Migrations and the worker keep a transaction
+open, which that pooler does not support. Leave `DATABASE_TEST_URL` pointed at a local
+`payguard_test` database. Do not run the test suite against the shared Supabase project.
+
+`pnpm --filter @payguard/db migrate` applies `packages/db/migrations` to whatever `DATABASE_URL`
+names. After it succeeds, run `demo:setup` the same way as a local database and paste the
+printed `PAYGUARD_DEPLOYMENT_ID` into `.env`.
 
 ## Environment variables
 

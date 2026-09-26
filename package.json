@@ -2,7 +2,7 @@
   "name": "payguard",
   "private": true,
   "version": "0.1.0",
-  "description": "PayGuard: bounded-policy agent payment authorization, backend + contracts. No frontend UI.",
+  "description": "PayGuard: bounded-policy agent payment authorization. Backend, contracts, and the owner control panel in apps/web.",
   "engines": {
     "node": ">=24.0.0"
   },

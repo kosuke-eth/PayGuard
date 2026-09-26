@@ -18,8 +18,24 @@ export interface PoolOptions {
   connectionString: string;
 }
 
+/**
+ * Local Postgres stays non-TLS. A Supabase host, or any URL with `sslmode`, turns TLS on.
+ * Supabase's chain often fails Node's default trust check, so those hosts use
+ * `rejectUnauthorized: false` unless the URL asks for `verify-ca` or `verify-full`.
+ */
+function poolConfig(connectionString: string): pg.PoolConfig {
+  const mode = /(?:\?|&)sslmode=([a-z-]+)/i.exec(connectionString)?.[1]?.toLowerCase() ?? null;
+  const supabase = /supabase\.(co|com)/i.test(connectionString);
+  let ssl: pg.PoolConfig['ssl'];
+  if (mode === 'disable') ssl = false;
+  else if (mode === 'verify-ca' || mode === 'verify-full') ssl = { rejectUnauthorized: true };
+  else if (mode === 'no-verify' || supabase) ssl = { rejectUnauthorized: false };
+  else if (mode === 'require') ssl = { rejectUnauthorized: true };
+  return { connectionString, ...(ssl === undefined ? {} : { ssl }) };
+}
+
 export function createPool(options: PoolOptions): pg.Pool {
-  return new Pool({ connectionString: options.connectionString });
+  return new Pool(poolConfig(options.connectionString));
 }
 
 /** Stage 1 connectivity proof: a real round trip against a real local PostgreSQL instance. */

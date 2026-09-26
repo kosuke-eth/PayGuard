@@ -22,6 +22,9 @@
  * migrated local Postgres (`DATABASE_URL`).
  */
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { PAYGUARD_VAULT_ABI, prepareCreatePolicy } from '@payguard/chain';
 import {
   createDeployment,
@@ -42,6 +45,9 @@ import {
 } from '@payguard/test-utils';
 import type pg from 'pg';
 import { createPublicClient, decodeEventLog, http, keccak256 } from 'viem';
+
+const repoEnvPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../.env');
+if (existsSync(repoEnvPath)) process.loadEnvFile(repoEnvPath);
 
 export const RPC_URL = process.env.RPC_URL ?? 'http://127.0.0.1:8545';
 export const CHAIN_ID = 31337;
@@ -176,7 +182,7 @@ export async function provisionFreshDemoDeployment(
           {
             routeId: v4Fixture.v4RouteId,
             adapter: v4Fixture.v4AdapterAddress,
-            kind: 'V4',
+            kind: 'UNISWAP_V4',
             inputToken: v4Fixture.rwaAddress,
             outputToken: v4Fixture.usdcAddress,
             subsidyModes: ['NONE'],
@@ -683,7 +689,9 @@ export function printDemoEnvBlock(deploymentId: string, provisioned: Provisioned
   console.log(`    v4 poolManagerAddress: ${provisioned.v4.poolManagerAddress}`);
   console.log(`    v4 routeId:            ${provisioned.v4.routeId}`);
   console.log('');
-  console.log('  B4 real 1inch Aqua/SwapVM maker-liquidation route (a third selectable demo profile):');
+  console.log(
+    '  B4 real 1inch Aqua/SwapVM maker-liquidation route (a third selectable demo profile):',
+  );
   console.log(`    aqua vaultId (DB):    ${provisioned.aqua.vaultId}`);
   console.log(`    aqua demo profileId:  ${provisioned.aqua.policyId}`);
   console.log(`    aqua vaultAddress:    ${provisioned.aqua.vaultAddress}`);

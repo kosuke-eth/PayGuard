@@ -6,6 +6,9 @@
  * transaction: each loop tick either fully commits or the next tick retries from persisted state).
  */
 
+import { existsSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createLocalPublicClient } from '@payguard/chain';
 import { createPool } from '@payguard/db';
 import type { Address } from '@payguard/domain';
@@ -17,7 +20,13 @@ import { runOutboxTick } from './outboxLoop.js';
 import { runStartupRecovery } from './recovery.js';
 import { createSubmitDeps } from './submitPayment.js';
 
+function loadRepoDotenv(): void {
+  const envPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../.env');
+  if (existsSync(envPath)) process.loadEnvFile(envPath);
+}
+
 export async function main(): Promise<void> {
+  loadRepoDotenv();
   const config = loadWorkerConfig();
   const pool = createPool({ connectionString: config.databaseUrl });
   const publicClient = createLocalPublicClient({
