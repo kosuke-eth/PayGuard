@@ -51,5 +51,6 @@ contracts/*/out/
 contracts/*/cache/
 contracts/*/broadcast/
 
-# Local project documentation (kept on disk, intentionally not versioned)
-/docs/
+# Documentation is versioned by default.  Working plans, agent prompts, dated
+# audits, and generated execution evidence remain local to avoid turning the
+# repository into an agent-session archive.

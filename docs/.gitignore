@@ -1,0 +1,13 @@
+# Finder metadata
+.DS_Store
+
+# Copy-paste task prompts are local agent-session material. The scope,
+# acceptance, integration, verification, and source documents remain tracked.
+PAYGUARD_BACKEND_PROMPTS.md
+PAYGUARD_FRONTEND_PROMPTS.md
+PAYGUARD_RELEASE_PROMPT.md
+
+# Incremental agent-session state and generated verification output.
+implementation/STATE.md
+implementation/checkpoints/
+implementation/evidence/
