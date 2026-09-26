@@ -58,13 +58,15 @@ Your private key stays in the wallet. The API and the worker refuse to boot if a
 ## How it is built
 
 ```mermaid
-flowchart LR
+flowchart TB
   Panel["Owner panel"] --> API["API"]
   API --> DB["PostgreSQL"]
   API --> Vault["Vault"]
-  Worker["Relayer"] --> DB
-  Worker --> Vault
-  Vault --> Routes["Direct · Uniswap v4 · Aqua"]
+  DB --> Relayer["Relayer"]
+  Relayer --> Vault
+  Vault --> Direct["Direct transfer"]
+  Vault --> V4["Uniswap v4"]
+  Vault --> Aqua["Aqua / SwapVM"]
 ```
 
 | Piece | Where it lives |
