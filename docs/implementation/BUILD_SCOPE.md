@@ -47,6 +47,20 @@ Aqua is an independent optional adapter, not an assumed serial bridge to v4 (CLA
 - Local demo chain: Anvil, explicit `cancun` hardfork, distinct local chain ID (ARCH D07, 3.3).
 - v4-core pinned to inspected commit `d153b048` per ARCH 3.3/3.0; Solidity `0.8.26`, Cancun.
 
+## B0 scope decision (2026-09-17) — supersedes the table above where it conflicts
+
+`docs/PAYGUARD_BUILD_PROMPTS.md` and its Stage 6/7 scope no longer govern this repository. Current governing scope is `docs/PAYGUARD_FINAL_HACKATHON_MVP.md` plus `docs/PAYGUARD_AGENT_WORKFLOW.md`'s B/F/R gates (`docs/PAYGUARD_BACKEND_PROMPTS.md`, `docs/PAYGUARD_FRONTEND_PROMPTS.md`, `docs/PAYGUARD_RELEASE_PROMPT.md`). Effective changes from the Default scope table above:
+
+| Capability | Old status (row above) | New status |
+|---|---|---|
+| Independent Aqua/SwapVM taker adapter | Not selected unless explicitly enabled | **Required** — B4, independent official adapter through the existing `IPayGuardSettlementAdapter` boundary. Serial Aqua-to-v4 composition remains explicitly excluded. |
+| Real local v4 exact-output settlement | Required showcase path | **Required** — B3, through the existing payment pipeline (adapter, not just the bare Stage 1 fixture). |
+| Merchant subsidy (NONE/REQUIRED/BEST_EFFORT) | Required, deferred to Stage 6 | **Optional** — first optional extension after both required routes and frontend pass (per final plan section 4). Not a gate prerequisite. Status label for reporting purposes: `NOT_SELECTED` unless a future session explicitly selects and tests it. |
+| Frontend pages, components, styling, dashboard | Out of scope | **Required, reuse-only** — F0-F3, reusing the colleague's existing `main` presentation via a pinned-SHA detached-worktree import (F0), not rebuilt from scratch. |
+| Public-testnet deployment | Optional, explicitly gated | Unchanged: optional; local execution must work regardless. |
+
+Old Stage numbering (01-05, this file's table above) remains historical evidence for what those stages actually built and is not rewritten. New work is tracked under gate IDs B0-B5/F0-F3/R1 per `PAYGUARD_AGENT_WORKFLOW.md` section 7, in `checkpoints/B0.md` onward.
+
 ## Acceptance matrix (Stage 1 required checks -> where proven)
 
 | Required check | Proof location |

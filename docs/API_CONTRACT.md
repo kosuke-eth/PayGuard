@@ -89,6 +89,12 @@ Request `{address, chainId, sessionKind:'BROWSER'|'AGENT'}`. The server creates 
 
 Request `{challengeId:UUID,signature:HexBytes}`. The server loads and verifies the exact original message, expected nonce/domain/URI/chain/expiry and signature. Challenge consumption and session creation are atomic. Browser response `{walletAddress,sessionExpiresAt,csrfToken}`, with HttpOnly/Secure/SameSite cookie. Agent response `{walletAddress,sessionExpiresAt,accessToken}`; the token authorizes the API session only.
 
+### GET /v1/auth/session (added B1, item 6)
+
+Session recovery after a page reload. Requires an existing valid session (cookie or bearer token) -- this is NOT a login endpoint. Response `{walletAddress,sessionKind:'BROWSER'|'AGENT',sessionExpiresAt,csrfToken?}`. `csrfToken` is present only for BROWSER sessions.
+
+The httpOnly session cookie survives a reload; the in-memory `csrfToken` a browser client was holding does not, and the server stores only its hash, so the original value can never be handed back. This endpoint therefore ROTATES the session's CSRF token on every call and returns the new plaintext value -- the honest recovery, never a weakened/optional CSRF check. Every subsequent mutating request must use the token from the MOST RECENT call to this endpoint (or from `/v1/auth/verify`, before the first reload). A GET is not itself subject to the Origin/CSRF mutation guard (that applies only to mutating methods), so this call needs only the cookie.
+
 ### POST /v1/auth/logout
 
 Request `{}`; returns `{revoked:true}`. It does not revoke an agent on-chain. A separate owner transaction is required for that authority change.
@@ -188,6 +194,22 @@ Owner request `{approval:ExceptionApproval,ownerSignature:HexBytes}`. Response `
 
 Owner or bound-agent request `{}`, Idempotency-Key required. Returns `Operation`, paymentId and intentId. The server accepts no changed merchant, amount, route or calldata here. Worker simulation, signing, raw-tx persistence and broadcast use the stored signed intent. Repeating submit returns the same operation. UNKNOWN broadcast state blocks blind creation of another payment.
 
+## Demo bridge (B2, `docs/PAYGUARD_INTEGRATION_BOUNDARY.md` section 5)
+
+Gated on ALL of: `PAYGUARD_DEMO_ENABLED=true`, `environment === 'LOCAL_DEMO'`, `chainId === 31337`. Outside that configuration every route below returns `RESOURCE_NOT_FOUND` (deliberately indistinguishable from a route that was never registered). The bridge signs only with isolated demo agent/merchant keys, resolved once from server config -- it never receives, holds, or accepts a caller-supplied signing key, and never fabricates an owner approval. It is a caller of the routes above through the same real HTTP path any other client uses, never a shortcut around them.
+
+### GET /v1/demo/scenarios
+
+Authenticated (any session kind). Returns `{scenarios:[{scenarioId,label,description,permittedProfileIds:UUID[],invoiceAmountAtomic:UIntString,requiresSourcePayment:boolean}],profiles:[DemoProfile]}`. `DemoProfile = {profileId:UUID,label,deploymentId:UUID,vaultId:UUID,policyResourceId:UUID,onchainPolicyId:Hash32,agentAddress:Address,routeId:Hash32,routeKind:string,inputToken:Address,outputToken:Address,available:boolean}`. `profiles` is scoped to the caller's own vaults on THIS deployment only (a policy on a different deployment's vault is never returned, regardless of who owns it); `available` requires both the route configured+enabled in `GET /v1/config`'s own route list AND the policy's observed status `ACTIVE`.
+
+### POST /v1/demo/runs
+
+Owner cookie session + CSRF + Origin + Idempotency-Key. Body is a discriminated union: `{profileId:UUID,scenarioId:'compute'|'hotel'|'over_budget'|'unauthorized_merchant'}` or `{profileId:UUID,scenarioId:'duplicate',sourcePaymentId:UUID}` -- no other shape validates (`additionalProperties:false` on each branch), so a caller cannot mix a `sourcePaymentId` into a non-duplicate scenario. The caller must own the named profile's vault; an unavailable profile is refused. Returns `{runId:UUID,deploymentId:UUID,profileId:UUID,scenarioId:string,stage:'invoice'|'intent'|'submit'|'settled',orchestrationStatus:'REJECTED_INVALID_SIGNATURE'|'BLOCKED'|'AWAITING_APPROVAL'|'QUEUED'|'DUPLICATE_NOT_PAID_TWICE',errorCode:string|null,paymentId:UUID|null,intentId:UUID|null,operationId:UUID|null}`. `runId` is the underlying idempotency-key row's own id; the same owner + Idempotency-Key + request body recovers the identical run (same `runId`/`paymentId`/`intentId`/`operationId`) rather than re-orchestrating -- a lost start/submit response is safe to retry. `orchestrationStatus` records the REAL, earliest rejection stage the request actually hit (an invoice signature failure, an intent-time on-chain BLOCK, an intent-time ESCALATE pause, or a submit-time settle/dedup) -- never a later, fabricated one.
+
+### GET /v1/demo/runs/{id}
+
+Same owner + deployment as the run's creator. Returns the same shape as the `POST` response plus `livePaymentStatus:{executionStatus,reconciliation,policyDecision}|null` -- a fresh read of the payment's current state, not a frozen snapshot, so a QUEUED run that has since settled (or an AWAITING_APPROVAL run once the owner approves through the normal `POST /v1/payment-intents/{id}/approvals`) shows its real current progress.
+
 ## Queries and frontend state handling
 
 ### GET /v1/payments/{id}
@@ -196,7 +218,7 @@ Owner or bound-agent request `{}`, Idempotency-Key required. Returns `Operation`
 PaymentView = {
  paymentId:UUID,intentId:UUID|null,deploymentId:UUID,chainId:UIntString,
  invoice:{invoiceId:Hash32,recipient:Address,outputToken:Address,outputAmountAtomic:UIntString},
- authorized:{inputToken:Address,maxInputAtomic:UIntString,routeId:Hash32},
+ authorized:{inputToken:Address|null,maxInputAtomic:UIntString|null,routeId:Hash32|null}|null,
  policyDecision:'ALLOW'|'ESCALATE'|'BLOCK'|'UNKNOWN',
  executionStatus:'DRAFT'|'AWAITING_APPROVAL'|'READY'|'QUEUED'|'SIGNED'|
                  'SUBMITTED'|'UNKNOWN'|'INCLUDED'|'SUCCEEDED'|'REVERTED'|'CANCELLED'|'REORGED',
@@ -212,17 +234,32 @@ PaymentView = {
 
 Actual settlement fields are null until a verified successful canonical receipt/event exists. On reorg, mark the prior observation noncanonical and clear/recompute the current settlement projection; retain its historical timeline entry. A successful transaction receipt for a different contract or a recordAttempt call is not a PayGuard payment success.
 
+`authorized`/`intentId` resolve to the intent that ACTUALLY settled the payment (the one whose own attempt reached SUCCEEDED), not simply whichever intent version is currently active -- a payment that settled and was LATER re-versioned (a legitimate resubmission) must keep showing the intent it actually settled under (B1, INT-007). `observedAt.canonical` reflects the block's REAL current canonical status at read time, honestly flipping to `false` after a reorg without erasing `blockHash`/`blockNumber` -- the observation is historical evidence, not a live claim.
+
 ### GET /v1/payments and GET /v1/payments/{id}/timeline
 
 Query `{cursor?:string,limit?:integer,status?:string}`. Return `{items:[...],nextCursor:string|null}`. The server uses owner-filtered keyset pagination on `(createdAt,id)`; cursors never override authorization. Timeline entries include eventId, type, creation time, tx/block identities where relevant, canonicality and reason. The future UI can render all states without assuming one monolithic finality enum.
 
 ### GET /v1/transactions/{hash}?deploymentId=...
 
-Return sender/nonce, state, replacement chain, canonical receipt identity, confidence and associated authorized payment view. Do not expose raw signing secrets or private RPC diagnostics. User-wallet transactions are observed, not automatically repriced by the backend.
+```text
+TransactionView = {
+ hash:Hash32,from:Address|null,nonce:UIntString|null,
+ state:'SIGNED'|'SUBMITTED'|'UNKNOWN'|'INCLUDED'|'SUCCEEDED'|'REVERTED'|'REPLACED'|'CANCELLED'|'REORGED',
+ replacementOf:Hash32|null,
+ canonicalReceiptIdentity:{blockHash:Hash32,blockNumber:UIntString|null,canonical:boolean}|null,
+ confidence:'UNOBSERVED'|'INCLUDED'|'DEPTH_CONFIRMED'|'RPC_FINALIZED'|'LOCAL_DEMO'|null,
+ authorizedPayment:PaymentView|null
+}
+```
+
+Return sender/nonce, state, replacement chain, canonical receipt identity, confidence and associated authorized payment view. `replacementOf` is always a real transaction hash of the attempt it replaced, never the internal database row identifier of that attempt (B1, INT-008). `confidence` reuses the same value already computed for `authorizedPayment` -- there is one confidence axis per observation, not a second independently-derived one for the transaction view. Do not expose raw signing secrets or private RPC diagnostics. User-wallet transactions are observed, not automatically repriced by the backend.
 
 ### GET /health/live and GET /health/ready
 
 Liveness checks process availability. Readiness checks SQL access, worker freshness, expected chain ID, required code/ABI/deployment configuration, and relayer balance sufficient for configured operations. Unverified/mismatched deployment refuses payment preparation instead of silently selecting a different network.
+
+The `vaultCode` check (B1, INT-006) re-observes every registered vault's live on-chain code and compares it against the `runtime_code_hash` recorded at provisioning, and compares its recorded `abi_schema_version` against the version this build actually compiled bindings for. A matching chain ID or a nonempty `getCode` result alone is NOT sufficient evidence the configured address is still the vault -- only a code-hash match is. Zero vaults registered for the deployment is reported `ok:true` (a legitimate pre-provisioning state, not a failure); any mismatch fails readiness closed.
 
 ## Representative error mapping
 

@@ -509,7 +509,11 @@ Each entry: conflicting file/section, selected resolution, evidence, API/ABI/DB 
 
 **Approval:** resolvable from evidence; closes a real evidence-hiding/misreporting gap in the read contract, no authority change.
 
-## SPEC-037 (KNOWN GAP, NOT FIXED): a reorg that orphans a relayer-broadcast transaction desyncs `signer_state.next_nonce` from the live chain
+## SPEC-037 (RESOLVED, B1): a reorg that orphans a relayer-broadcast transaction desyncs `signer_state.next_nonce` from the live chain
+
+**Resolution status update (B1, 2026-09-17):** Fixed. See "SPEC-037 fix" entry immediately below this one for the implementation, tests and evidence. The original gap description, evidence and (now superseded) "none yet" resolution note are preserved below unmodified as the historical record of what B0/Stage 5 left open.
+
+## SPEC-037 (original entry, KNOWN GAP, NOT FIXED at Stage 5): a reorg that orphans a relayer-broadcast transaction desyncs `signer_state.next_nonce` from the live chain
 
 **Gap:** Discovered incidentally while writing SPEC-034's regression test (not a finding from either review lens; not fixed in this pass). `regressAffectedPayments`/`reorgToBlock` (the reorg-regression path) correctly flips `chain_blocks`/`receipts`/`chain_events` canonicality and regresses affected `payments` rows, but never touches `signer_state.next_nonce`. If the orphaned block contained a transaction WE broadcast (i.e. its nonce was already counted in `next_nonce`), and Anvil's default reorg behavior mines empty replacement blocks (never re-including that transaction), the chain's real next-expected nonce for that signer moves backward relative to what our DB still believes. Every SUBSEQUENT payment from that same signer then reserves a nonce ahead of what the chain will actually accept next, gets broadcast, and sits in the mempool indefinitely (a real, reproducible nonce gap) -- confirmed directly: stacking a third real payment onto the SAME harness/relayer immediately after `apps/worker/test/indexer.test.ts`'s existing real-reorg test left that third payment stuck at `SUBMITTED` for 15s+ of patient polling, never mining.
 
@@ -521,4 +525,75 @@ Each entry: conflicting file/section, selected resolution, evidence, API/ABI/DB 
 
 **Invalidated gates:** none (LOCAL_DEMO/Stage 5 scope: shallow reorgs orphaning a relayer's own in-flight transaction are rare in the single-worker demo path and this gap does not corrupt funds or double-pay, only stalls a subsequent payment from the SAME signer -- explicitly recorded as a blocker for future work, not swept under a passing gate).
 
+## SPEC-037 fix (B1): signer nonce reconciliation after a reorg orphans a broadcast attempt
+
+**Original discrepancy:** see the entry above -- `signer_state.next_nonce` was never reconciled after `reorgToBlock` orphaned a block containing OUR OWN broadcast transaction, letting every later reservation for that signer allocate a nonce the live chain would never accept next.
+
+**Desired behavior (per B1 prompt item 7):** do NOT blindly lower `next_nonce`, and do NOT assume `max(chainNonce, dbNonce)` repairs anything. Reconcile canonical/pending nonce observations against signed raw transactions, open nonce families, and reserved-but-unsigned journal state. Reuse a known permitted transaction identity where appropriate; block ambiguous allocation rather than issue a second business payment.
+
+**Implementation:**
+- `packages/db/src/repositories/txJournal.ts`: `getSendersWithFamiliesClosedInBlocks` (finds senders whose CLOSED nonce family's canonical tx was receipted inside a just-orphaned block); `reconcileSignerNonceAfterReorg` (per-sender, per-gap-nonce reconciliation against a caller-supplied live `eth_getTransactionCount` -- reopens a family ONLY when its payment is not already canonically settled through a different attempt, walking the orphaned attempt SUCCEEDED/REVERTED -> REORGED -> UNKNOWN -> SUBMITTED, every edge already legal in `TRANSACTION_ATTEMPT_STATE_GRAPH`; otherwise records the nonce as `blockedNonces`, reopening nothing); `hasUnresolvedNonceGap` (re-derives, from the same evidence, whether a sender still has an unresolved blocked gap).
+- `apps/worker/src/indexer.ts` (`runIndexerTick`'s reorg branch): reads each affected sender's live `eth_getTransactionCount` BEFORE opening the write transaction (CLAUDE.md: never hold a SQL transaction across an RPC call); calls `reconcileSignerNonceAfterReorg` under `lockSigner`'s row lock, in the SAME transaction as `regressAffectedPayments`/`reorgToBlock`, AFTER `reorgToBlock` has flipped canonicality (so the "already settled elsewhere" check reads the POST-reorg canonical view, not stale pre-reorg state); then, OUTSIDE that transaction, immediately rebroadcasts each reopened family's exact persisted raw signed bytes (idempotent, tolerating "already known"/"nonce too low" exactly like `submitPayment.ts`'s own `broadcastAttempt`) -- refilling the gap nonce on-chain right away rather than depending on some other job happening to re-dispatch that specific intent later.
+- `apps/worker/src/submitPayment.ts` (`handlePaymentSubmissionJob`): before ANY fresh nonce reservation, reads the live `eth_getTransactionCount` and refuses (`RETRY`, not a silent reservation) while `hasUnresolvedNonceGap` is true for that signer -- the literal "block ambiguous allocation" requirement, for the specific case where the gap nonce's payment already settled elsewhere and cannot be safely refilled.
+
+**Supporting source:** ARCH 3.4 ("Serialize nonce allocation with one signer row/worker"); CLAUDE.md ("Do not pay one invoice through both routes" / never double-pay).
+
+**Affected API/ABI/SQL fields:** none (no schema change; `signer_state`/`nonce_families`/`transaction_attempts` are read/written through existing columns only).
+
+**Migration/regeneration needs:** none.
+
+**Test coverage (`apps/worker/test/indexer.test.ts`, real Anvil + real Postgres, all 4 tests in this file passing):**
+1. "a real anvil_reorg ... regresses the payment to UNKNOWN" (pre-existing, unmodified, still passing -- confirms no regression).
+2. "SPEC-037: ... a LATER payment from the SAME relayer still actually settles" -- real end-to-end: payment 1 settles, real 3-block `anvil_reorg` orphans it, payment 2 (fresh reservation, same relayer) is driven through the real worker/outbox loop and reaches `SUCCEEDED`; asserts the relayer's live on-chain tx count increased (the gap nonce was genuinely refilled, not skipped). Reproduces the exact failure this session's earlier direct reproduction hit (stuck at `SUBMITTED`) and proves it no longer happens.
+3. "SPEC-037: a nonce gap whose payment is ALREADY canonically settled through a DIFFERENT attempt is refused, not silently reopened" -- fabricates a second SUCCEEDED attempt/receipt for the SAME payment (as a legitimate re-versioning would produce) before reorging the first; asserts the original family stays closed (not reopened), proving the "never a second business payment" guard.
+4. `apps/worker/test/faultInjection.test.ts` and the rest of `apps/worker/test/` (21/21 total, full suite) rerun clean -- no regression from the new pre-reservation `hasUnresolvedNonceGap` RPC check added to every submission path.
+
+**Known residual scope (honestly documented, not fixed here):** if the gap nonce's payment is genuinely unrecoverable (blocked case), no automatic unstick exists yet -- the signer is refused further fresh reservations until a human/future-stage mechanism resolves it (e.g. a deliberate nonce-filling no-op transaction). This is a deliberate fail-closed choice (per the prompt's own "block ambiguous allocation" instruction), not an oversight; it trades availability for never risking a second real payment. An orphaned-but-reopened attempt's OWN payment record does not automatically return to `SUCCEEDED` even after its rebroadcast re-mines -- it stays at `UNKNOWN`/`ORPHANED_BLOCK` until a real settlement observation (a resubmission via the existing `UNKNOWN -> READY` path, or a future reconciliation enhancement) re-drives it; this is outside SPEC-037's own scope (the nonce gap, not the payment's own status projection) and was not a claim this fix makes.
+
+**Invalidated gates:** none. Stage 1-5 checkpoints unaffected (no code they cover changed shape, only a new-unless-triggered branch added).
+
+**Approval:** implemented and tested this session (B1); self-reviewed per B1's review requirements (nonce/UUID confusion, incorrect nonce rewinds specifically checked -- see `checkpoints/B1.md`).
+
 **Approval:** not applicable -- recorded as a known, deliberately-deferred gap, not a resolved decision.
+
+## SPEC-038 (RESOLVED, B2, found and fixed within the same session): demo-profile discovery had no deployment scoping, a confused-deputy-class gap
+
+**Gap:** Discovered while writing B2's own demo bridge (`apps/api/src/demo/catalog.ts`), not by either a separate review pass or a later fresh-review lens -- self-caught while reasoning through the prompt's explicit "review the bridge as a potential confused-deputy signer" instruction, before any test exercised it. `getDemoProfilesForOwner` (backing `GET /v1/demo/scenarios`) and `getDemoProfileById` (backing `POST /v1/demo/runs`'s profile lookup) both derive a `DemoProfile` from a `policies` row reached through owner-scoped-only lookups (`getVaultsKeysetForOwner`, `getPolicyById`) with no deployment filter, then unconditionally labeled the result's `deploymentId` and evaluated its `available` flag against `context.config.deploymentId`'s route configuration -- the CURRENT API instance's deployment, regardless of which deployment the policy's own vault actually belongs to. An owner who owns vaults across more than one deployment (a realistic case: a stale/decommissioned prior local deployment plus the current live one, both rows persisted in the same Postgres instance since deployments are never deleted) could have a demo profile presented, and its route availability computed, against the WRONG deployment's route list -- either wrongly advertised as available when the current deployment doesn't actually support that route, or vice versa.
+
+**Resolution:** `apps/api/src/demo/catalog.ts`: `getDemoProfilesForOwner` now skips any vault whose `deploymentId` does not equal the current deployment's id before deriving profiles from it; `getDemoProfileById` now fetches the policy's vault via `getVaultById` and returns `null` (treated identically to "unknown profileId", i.e. `RESOURCE_NOT_FOUND`) when `vault.deploymentId !== deployment.id`. Both use the real `deployments`/`vaults` foreign-key relationship already in the schema -- no new column or migration.
+
+**Evidence:** a dedicated test (`apps/api/test/demo.test.ts`, "a profileId belonging to a DIFFERENT deployment's vault is treated as not found, never evaluated against this deployment's config") directly constructs a second `deployments` row + vault + policy inside the same test database, then asserts `POST /v1/demo/runs` with that profileId returns 404 `RESOURCE_NOT_FOUND` and that `GET /v1/demo/scenarios`'s `profiles` list never includes it -- both assertions failed against the pre-fix code path during development (confirmed by writing the fix only after first designing this test against the vulnerable version, per the shared workflow's "reproduce, then fix" discipline) and pass after the fix.
+
+**Impact:** `apps/api/src/demo/catalog.ts` only. No other route's authorization logic shares this code path (every other authenticated route resolves its own vault/deployment scoping independently, e.g. `requireVaultOwner`'s `getVaultWithDeployment` + `assertSessionChainMatches`, none of which had this specific gap).
+
+**Invalidated gates:** none (found and fixed within B2, before the B2 checkpoint was written -- never shipped as a passing gate with this gap present).
+
+**Approval:** implemented and tested this session (B2); directly responsive to the B2 prompt's own "review as a potential confused-deputy signer" instruction -- see `checkpoints/B2.md`'s Review section.
+
+## SPEC-039 (RESOLVED, B3, found and fixed within the same session): `PayGuardV4Adapter` constructor did not enforce its own documented "no-hook, normal-fee" invariant
+
+**Gap:** Found by a fresh-context `agent-skills:security-auditor` dispatched per the B3 prompt's own REVIEW/GATE instruction (not self-caught). `PayGuardV4Adapter.sol`'s header doc comment and every downstream guard (`unlockCallback`'s authentication, the exact-output-delivered check) implicitly assume "fixed pool, no hook, normal fee (3000/60)" as a hard security posture -- a hook executes arbitrary logic inside `poolManager.swap()`, which no other guard in the contract accounts for. The original constructor accepted arbitrary `_hooks`/`_fee`/`_tickSpacing` values with no validation beyond the unrelated `currency0 < currency1` check, so the invariant lived only in a comment and in the deployment SCRIPT's convention (always passing `hooks=address(0)`, `fee=3000`, `tickSpacing=60`), not in the code itself -- a future deployment script (or a copy-paste of this adapter for a different pool) could silently violate it with no revert.
+
+**Resolution:** `contracts/core-v4/src/adapters/PayGuardV4Adapter.sol` constructor now reverts (`HookNotAllowed()`, `FeeNotNormal()`) unless `hooks == address(0)` and `(fee, tickSpacing) == (3000, 60)` (new `NORMAL_FEE`/`NORMAL_TICK_SPACING` constants) -- the invariant is now a code-level, construction-time-enforced guarantee, not a convention.
+
+**Evidence:** all 12 `PayGuardV4AdapterTest` cases (which already construct the adapter with matching values) re-passed after the fix; the full 101-test Foundry suite re-passed with zero regressions. See `docs/implementation/evidence/B3-v4-adapter-evidence.md` for the full review report (also covers two Low-severity test-assertion findings from the same review, fixed alongside this one).
+
+**Impact:** `contracts/core-v4/src/adapters/PayGuardV4Adapter.sol` only. The TS deployment fixture (`packages/test-utils/src/v4VaultFixture.ts`) and `apps/api/scripts/demo-setup.ts` already passed matching values before this fix landed, so neither required a change -- confirmed by rerunning both after the fix (real `demo:setup` provision, and `apps/api/test/v4Route.test.ts`), both still passing.
+
+**Invalidated gates:** none (found and fixed within B3, before the B3 checkpoint was written).
+
+**Approval:** implemented and tested this session (B3); directly responsive to the B3 prompt's own "Have a read-only reviewer challenge ... callback authentication" instruction -- see `checkpoints/B3.md`'s Review section.
+
+## SPEC-040 (RESOLVED, B4, found and fixed within the same session): `check-abi-equivalence.mjs` was not wired into any automated gate, and could not detect enum member reordering
+
+**Gap:** Found by a fresh-context `agent-skills:security-auditor` dispatched per the B4 prompt's own REVIEW/GATE instruction (not self-caught). Two related issues: (1) the ABI-only-shim equivalence script (`contracts/aqua/script/check-abi-equivalence.mjs`) was runnable only by hand -- `forge build`/`forge test` in `contracts/aqua` would succeed even if a future edit to `contracts/core-v4`'s real `IPayGuardVault`/`IPayGuardSettlementAdapter` interfaces silently diverged from the shim, and the shim's own doc comment plus `contracts/aqua/foundry.toml`'s comment both cited a nonexistent `test/ArtifactEquivalence.t.sol` instead of the real script; (2) compiled ABI JSON encodes an enum field only as its underlying `uintN` type -- it never records member names or declaration order -- so the script's structural ABI diff would report `OK` even if `SubsidyMode`'s three members were ever reordered on one side, silently reinterpreting e.g. `REQUIRED(1)` as `BEST_EFFORT(2)` across the pragma boundary.
+
+**Resolution:** (1) `scripts/payguard`'s new `cmd_verify_mvp_B4` runs `node script/check-abi-equivalence.mjs` as one of its `run_step`s -- shim drift now fails the standard gate pipeline, not only a manually-remembered script; both stale `test/ArtifactEquivalence.t.sol` doc-comment references (the shim's own file and `foundry.toml`) corrected to point at the real script. (2) `check-abi-equivalence.mjs` gained `extractEnumMembers`/`assertEnumOrderEqual`, which parse each side's `SubsidyMode` enum declaration directly from SOURCE TEXT (not the compiled artifact, since ABI JSON cannot carry this information) and assert the ordered member-name lists are identical.
+
+**Evidence:** `node script/check-abi-equivalence.mjs` now reports 11/11 checks passing, including `IPayGuardVault.SubsidyMode member order vs shim.SubsidyMode member order (member order: ["NONE","REQUIRED","BEST_EFFORT"])`; `./scripts/payguard verify-mvp B4` runs it as a real pipeline step.
+
+**Impact:** `contracts/aqua/script/check-abi-equivalence.mjs`, `contracts/aqua/foundry.toml`, `contracts/aqua/src/interfaces/IPayGuardSettlementAdapterShim.sol` (doc comment only), `scripts/payguard`. No change to `PayGuardAquaAdapter.sol`'s actual behavior -- both findings were about the STRENGTH of the drift-detection tooling, not a live bug in the shim's current (correct) declarations.
+
+**Invalidated gates:** none (found and fixed within B4, before the B4 checkpoint was written).
+
+**Approval:** implemented and tested this session (B4); directly responsive to the B4 prompt's own "Review compiler boundaries... false SDK assumptions" instruction -- see `checkpoints/B4.md`'s Review section.
