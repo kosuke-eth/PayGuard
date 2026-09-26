@@ -8,8 +8,12 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { PAYGUARD_VAULT_ABI, prepareCreatePolicy } from '@payguard/chain';
 import {
   attachCanonicalReceipt,
+  createIntentVersion,
+  createSignedArtifact,
   getPaymentById,
   markBroadcast,
+  recordBlock,
+  recordEvent,
   recordSignedAttempt,
   reserveNonceFamily,
   updatePaymentState,
@@ -17,10 +21,12 @@ import {
 } from '@payguard/db';
 import { hashIntent, hashInvoice } from '@payguard/domain';
 import { MERCHANT_PRIVATE_KEY } from '@payguard/test-utils';
+import Ajv from 'ajv';
 import { decodeEventLog } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { addressToBuffer } from '../src/auth.js';
+import { PAYMENT_VIEW_SCHEMA, TRANSACTION_VIEW_SCHEMA } from '../src/schemas.js';
 import {
   authHeaders,
   createTestHarness,
@@ -30,6 +36,10 @@ import {
   seedWallet,
   type TestHarness,
 } from './helpers/testApp.js';
+
+const ajv = new Ajv({ strict: false });
+const validatePaymentView = ajv.compile(PAYMENT_VIEW_SCHEMA);
+const validateTransactionView = ajv.compile(TRANSACTION_VIEW_SCHEMA);
 
 let harness: TestHarness;
 
@@ -540,5 +550,316 @@ describe('GET /v1/transactions/:hash', () => {
     });
     expect(response.statusCode).toBe(503);
     expect(response.json().error.code).toBe('DEPLOYMENT_MISMATCH');
+  }, 20_000);
+});
+
+describe('B1 read-model correctness (INT-006..INT-011)', () => {
+  it('a not-yet-settled payment already reports the wire-shaped authorized.inputToken/routeId from its active intent, and the full body matches PAYMENT_VIEW_SCHEMA', async () => {
+    const { session, paymentId } = await setupAllowedPayment();
+    const response = await harness.built.app.inject({
+      method: 'GET',
+      url: `/v1/payments/${paymentId}`,
+      headers: authHeaders(session),
+    });
+    expect(response.statusCode).toBe(200);
+    const body = response.json().data;
+    expect(validatePaymentView(body)).toBe(true);
+    expect(body.authorized.inputToken.toLowerCase()).toBe(
+      harness.fixture.tokenAddress.toLowerCase(),
+    );
+    expect(body.authorized.routeId).toBe(`0x${'0'.repeat(64)}`);
+  }, 20_000);
+
+  it('INT-007: a payment that actually settled under intent v1 keeps showing v1s authorized/settlement fields after the intent is re-versioned to v2 -- never silently reassembled from whichever intent happens to be active now', async () => {
+    const { session, paymentId, intentId, vaultId } = await setupAllowedPayment();
+
+    // Drive the payment to a REAL SUCCEEDED settlement under intent v1, with real chain_blocks +
+    // chain_events rows exactly like a real `reconcileAttempt` would have written.
+    const txHash = Buffer.from(randomBytes(32));
+    const blockHash = Buffer.from(randomBytes(32));
+    const actualInput = '999000';
+    const { family, attempt } = await withTransaction(harness.pool, async (client) => {
+      const family = await reserveNonceFamily(client, {
+        id: randomUUID(),
+        deploymentId: harness.deploymentId,
+        sender: addressToBuffer(harness.fixture.ownerAccount.address),
+        intentId,
+        unsignedRequest: {},
+        expectedTo: addressToBuffer(harness.fixture.vaultAddress),
+        expectedCalldataHash: Buffer.from(randomBytes(32)),
+      });
+      const attempt = await recordSignedAttempt(client, {
+        id: randomUUID(),
+        deploymentId: harness.deploymentId,
+        nonceFamilyId: family.id,
+        txHash,
+        rawSignedTransaction: Buffer.from('02', 'hex'),
+      });
+      await recordBlock(client, {
+        deploymentId: harness.deploymentId,
+        blockHash,
+        blockNumber: 42n,
+        parentHash: Buffer.alloc(32, 0),
+        canonical: true,
+        confidence: 'LOCAL_DEMO',
+      });
+      await recordEvent(client, {
+        deploymentId: harness.deploymentId,
+        blockHash,
+        logIndex: 0n,
+        txHash,
+        emitter: addressToBuffer(harness.fixture.vaultAddress),
+        topic0: Buffer.alloc(32, 1),
+        topics: [],
+        data: Buffer.alloc(0),
+        decodedName: 'PaymentExecuted',
+        decodedPayload: { actualInput, exactOutput: '1000000', subsidyAmount: '0' },
+        canonical: true,
+      });
+      return { family, attempt };
+    });
+
+    for (const next of ['QUEUED', 'SIGNED', 'SUBMITTED'] as const) {
+      const payment = await getPaymentById(harness.pool, paymentId);
+      if (!payment) throw new Error('payment vanished');
+      await withTransaction(harness.pool, (client) =>
+        updatePaymentState(client, {
+          paymentId,
+          expectedVersion: payment.stateVersion,
+          current: {
+            policyDecision: payment.policyDecision,
+            executionStatus: payment.executionStatus,
+            confidence: payment.confidence,
+            reconciliation: payment.reconciliation,
+          },
+          next: { executionStatus: next },
+        }),
+      );
+    }
+    await withTransaction(harness.pool, (client) =>
+      markBroadcast(client, { attemptId: attempt.id, isFirstBroadcast: true }),
+    );
+    await withTransaction(harness.pool, (client) =>
+      attachCanonicalReceipt(client, {
+        attemptId: attempt.id,
+        nonceFamilyId: family.id,
+        txHash,
+        state: 'SUCCEEDED',
+      }),
+    );
+    const settled = await getPaymentById(harness.pool, paymentId);
+    if (!settled) throw new Error('payment vanished');
+    await withTransaction(harness.pool, (client) =>
+      updatePaymentState(client, {
+        paymentId,
+        expectedVersion: settled.stateVersion,
+        current: {
+          policyDecision: settled.policyDecision,
+          executionStatus: 'SUBMITTED',
+          confidence: settled.confidence,
+          reconciliation: settled.reconciliation,
+        },
+        next: {
+          executionStatus: 'SUCCEEDED',
+          confidence: 'LOCAL_DEMO',
+          reconciliation: 'MATCHED',
+          observedBlockHash: blockHash,
+        },
+      }),
+    );
+
+    // NOW re-version the intent (as a legitimate agent resubmission would): v1 retires, v2 exists.
+    const artifactId = randomUUID();
+    await withTransaction(harness.pool, (client) =>
+      createSignedArtifact(client, {
+        id: artifactId,
+        kind: 'INTENT',
+        digest: Buffer.from(randomBytes(32)),
+        signer: addressToBuffer(harness.fixture.agentAccount.address),
+        encodedPayload: Buffer.alloc(0),
+        typedData: {},
+        signature: Buffer.alloc(65, 1),
+        signatureHash: Buffer.from(randomBytes(32)),
+        schemaVersion: '1',
+      }),
+    );
+    const v1 = await withTransaction(harness.pool, (client) =>
+      client.query('SELECT policy_id, vault_id FROM payment_intents WHERE id = $1', [intentId]),
+    );
+    const policyId = v1.rows[0].policy_id as string;
+    await withTransaction(harness.pool, (client) =>
+      createIntentVersion(client, {
+        id: randomUUID(),
+        paymentId,
+        vaultId,
+        policyId,
+        version: 2n,
+        intentDigest: Buffer.from(randomBytes(32)),
+        artifactId,
+        agentNonce: 999999n,
+        maxInputAmount: 1n,
+        validUntil: 99999999999n,
+      }),
+    );
+
+    // Confirm intent v1 is genuinely retired now (the precondition this test is actually about).
+    const retiredCheck = await harness.pool.query(
+      'SELECT retired_at FROM payment_intents WHERE id = $1',
+      [intentId],
+    );
+    expect(retiredCheck.rows[0].retired_at).not.toBeNull();
+
+    const response = await harness.built.app.inject({
+      method: 'GET',
+      url: `/v1/payments/${paymentId}`,
+      headers: authHeaders(session),
+    });
+    expect(response.statusCode).toBe(200);
+    const body = response.json().data;
+    expect(validatePaymentView(body)).toBe(true);
+    // The historically-correct intent (v1, now retired) must still be the one reflected here --
+    // NOT v2 (which never settled anything and carries a different maxInputAmount).
+    expect(body.intentId).toBe(intentId);
+    expect(body.authorized.maxInputAtomic).toBe('1000000');
+    expect(body.authorized.inputToken.toLowerCase()).toBe(
+      harness.fixture.tokenAddress.toLowerCase(),
+    );
+    expect(body.authorized.routeId).toBe(`0x${'0'.repeat(64)}`);
+    expect(body.settlement.actualInputAtomic).toBe(actualInput);
+    expect(body.observedAt.blockNumber).toBe('42');
+    expect(body.observedAt.canonical).toBe(true);
+
+    // A subsequent reorg flips this exact block non-canonical. Evidence (the block/hash) must
+    // stay visible -- it must NOT be erased -- but must honestly stop claiming canonicality, and
+    // settlement must clear once executionStatus leaves SUCCEEDED (mirrors what
+    // apps/worker/src/indexer.ts's regressAffectedPayments actually does on a real reorg).
+    await harness.pool.query(
+      'UPDATE chain_blocks SET canonical = false WHERE deployment_id = $1 AND block_hash = $2',
+      [harness.deploymentId, blockHash],
+    );
+    const preReorg = await getPaymentById(harness.pool, paymentId);
+    if (!preReorg) throw new Error('payment vanished');
+    await withTransaction(harness.pool, (client) =>
+      updatePaymentState(client, {
+        paymentId,
+        expectedVersion: preReorg.stateVersion,
+        current: {
+          policyDecision: preReorg.policyDecision,
+          executionStatus: 'SUCCEEDED',
+          confidence: preReorg.confidence,
+          reconciliation: preReorg.reconciliation,
+        },
+        next: { executionStatus: 'REORGED', confidence: 'UNOBSERVED' },
+      }),
+    );
+    const reorged = await getPaymentById(harness.pool, paymentId);
+    if (!reorged) throw new Error('payment vanished');
+    await withTransaction(harness.pool, (client) =>
+      updatePaymentState(client, {
+        paymentId,
+        expectedVersion: reorged.stateVersion,
+        current: {
+          policyDecision: reorged.policyDecision,
+          executionStatus: 'REORGED',
+          confidence: 'UNOBSERVED',
+          reconciliation: reorged.reconciliation,
+        },
+        next: {
+          executionStatus: 'UNKNOWN',
+          reasonCode: 'ORPHANED_BLOCK',
+          reconciliation: 'NOT_CHECKED',
+        },
+      }),
+    );
+
+    const afterReorg = await harness.built.app.inject({
+      method: 'GET',
+      url: `/v1/payments/${paymentId}`,
+      headers: authHeaders(session),
+    });
+    const reorgBody = afterReorg.json().data;
+    expect(validatePaymentView(reorgBody)).toBe(true);
+    expect(reorgBody.executionStatus).toBe('UNKNOWN');
+    expect(reorgBody.settlement).toBeNull();
+    // Evidence preserved, honestly reported as no-longer-canonical.
+    expect(reorgBody.observedAt).not.toBeNull();
+    expect(reorgBody.observedAt.blockHash.toLowerCase()).toBe(`0x${blockHash.toString('hex')}`);
+    expect(reorgBody.observedAt.blockNumber).toBe('42');
+    expect(reorgBody.observedAt.canonical).toBe(false);
+  }, 30_000);
+
+  it('INT-008: GET /v1/transactions/:hash reports real from/nonce/canonicalReceiptIdentity, and replacementOf is a real tx hash, never a raw attempt UUID', async () => {
+    const { session, paymentId, intentId } = await setupAllowedPayment();
+
+    const firstHash = Buffer.from(randomBytes(32));
+    const replacementHash = Buffer.from(randomBytes(32));
+    const blockHash = Buffer.from(randomBytes(32));
+    const sender = addressToBuffer(harness.fixture.ownerAccount.address);
+
+    const { family, replacementAttempt } = await withTransaction(harness.pool, async (client) => {
+      const family = await reserveNonceFamily(client, {
+        id: randomUUID(),
+        deploymentId: harness.deploymentId,
+        sender,
+        intentId,
+        unsignedRequest: {},
+        expectedTo: addressToBuffer(harness.fixture.vaultAddress),
+        expectedCalldataHash: Buffer.from(randomBytes(32)),
+      });
+      const firstAttempt = await recordSignedAttempt(client, {
+        id: randomUUID(),
+        deploymentId: harness.deploymentId,
+        nonceFamilyId: family.id,
+        txHash: firstHash,
+        rawSignedTransaction: Buffer.from('02', 'hex'),
+      });
+      // A real fee-bump replacement: a NEW attempt row, `replacement_of_id` pointing back at the
+      // first attempt's UUID -- exactly what a wire response must resolve to a hash, not echo raw.
+      const replacementAttempt = await client.query(
+        `INSERT INTO transaction_attempts (id, deployment_id, nonce_family_id, tx_hash, raw_signed_transaction, replacement_of_id, state)
+         VALUES ($1,$2,$3,$4,$5,$6,'SUBMITTED') RETURNING *`,
+        [
+          randomUUID(),
+          harness.deploymentId,
+          family.id,
+          replacementHash,
+          Buffer.from('03', 'hex'),
+          firstAttempt.id,
+        ],
+      );
+      await recordBlock(client, {
+        deploymentId: harness.deploymentId,
+        blockHash,
+        blockNumber: 7n,
+        parentHash: Buffer.alloc(32, 0),
+        canonical: true,
+        confidence: 'LOCAL_DEMO',
+      });
+      await client.query(
+        `INSERT INTO receipts (deployment_id, tx_hash, block_hash, receipt_status, canonical, raw_receipt)
+         VALUES ($1,$2,$3,1,true,'{}')`,
+        [harness.deploymentId, replacementHash, blockHash],
+      );
+      return { family, replacementAttempt: replacementAttempt.rows[0] };
+    });
+    void replacementAttempt;
+
+    const response = await harness.built.app.inject({
+      method: 'GET',
+      url: `/v1/transactions/0x${replacementHash.toString('hex')}?deploymentId=${harness.deploymentId}`,
+      headers: authHeaders(session),
+    });
+    expect(response.statusCode).toBe(200);
+    const body = response.json().data;
+    expect(validateTransactionView(body)).toBe(true);
+    expect(body.from.toLowerCase()).toBe(harness.fixture.ownerAccount.address.toLowerCase());
+    expect(body.nonce).toBe(String(family.nonce));
+    expect(body.replacementOf.toLowerCase()).toBe(`0x${firstHash.toString('hex')}`);
+    // Never the raw UUID leaking onto the wire as if it were a hash.
+    expect(body.replacementOf).not.toMatch(/^0x[0-9a-f]{8}-/);
+    expect(body.canonicalReceiptIdentity).not.toBeNull();
+    expect(body.canonicalReceiptIdentity.blockNumber).toBe('7');
+    expect(body.canonicalReceiptIdentity.canonical).toBe(true);
+    void paymentId;
   }, 20_000);
 });

@@ -39,6 +39,7 @@ const SHARED_SCHEMA_NAMES = [
   'HASH_PARAM',
   'KEYSET_QUERY',
   'TRANSACTION_QUERY',
+  'DEMO_RUN_START_BODY',
 ] as const;
 
 describe('handler schemas match the published contract exactly', () => {

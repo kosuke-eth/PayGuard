@@ -228,6 +228,36 @@ export const APPROVAL_BODY = strictObject(
   ['approval', 'ownerSignature'],
 );
 
+/**
+ * B2 demo bridge start request. A validated discriminated union, not a permissive bag of optional
+ * fields (`PAYGUARD_INTEGRATION_BOUNDARY.md` §5): a normal scenario takes only `profileId` +
+ * `scenarioId`; only the literal `scenarioId:'duplicate'` branch may additionally carry
+ * `sourcePaymentId`, and it MUST. No branch accepts an arbitrary recipient, private key, router
+ * calldata, signature target, or program bytes -- there is nothing here for one to attach to.
+ */
+export const DEMO_RUN_START_BODY = {
+  oneOf: [
+    strictObject(
+      {
+        profileId: UUID,
+        scenarioId: {
+          type: 'string',
+          enum: ['compute', 'hotel', 'over_budget', 'unauthorized_merchant'],
+        },
+      },
+      ['profileId', 'scenarioId'],
+    ),
+    strictObject(
+      {
+        profileId: UUID,
+        scenarioId: { type: 'string', const: 'duplicate' },
+        sourcePaymentId: UUID,
+      },
+      ['profileId', 'scenarioId', 'sourcePaymentId'],
+    ),
+  ],
+} as const;
+
 // --- params / querystrings ---------------------------------------------------------------------
 
 export const ID_PARAM = strictObject({ id: UUID }, ['id']);
@@ -243,4 +273,196 @@ export const KEYSET_QUERY = {
   },
 } as const;
 
+// --- response shapes (B1, item 3) ---------------------------------------------------------------
+//
+// These are explicit, AJV-checkable descriptions of what GET /v1/payments/{id},
+// /v1/payments/{id}/timeline, and /v1/transactions/{hash} actually return -- not wired into
+// Fastify's live `schema.response` (which would additionally activate fast-json-stringify
+// serialization/field-stripping across a codebase with no prior precedent for that), but used
+// directly by the regression tests (`payments.test.ts`) to assert the real response body matches
+// the real wire contract, and by `generate-openapi.ts` so the generated OpenAPI document is no
+// longer just a generic "Success<T> envelope" placeholder for these three routes.
+//
+// A field that is null pre-settlement/pre-observation stays explicitly nullable here -- this is
+// NOT the same defect class as INT-007's hardcoded-null-regardless-of-data-availability bug; a
+// schema saying "may be null" while the code says "always null" would have hidden that exact bug.
+
+function nullable<S extends Record<string, unknown>>(schema: S) {
+  return { anyOf: [schema, { type: 'null' }] } as const;
+}
+
+const POLICY_DECISION_ENUM = {
+  type: 'string',
+  enum: ['ALLOW', 'ESCALATE', 'BLOCK', 'UNKNOWN'],
+} as const;
+const EXECUTION_STATUS_ENUM = {
+  type: 'string',
+  enum: [
+    'DRAFT',
+    'AWAITING_APPROVAL',
+    'READY',
+    'QUEUED',
+    'SIGNED',
+    'SUBMITTED',
+    'UNKNOWN',
+    'INCLUDED',
+    'SUCCEEDED',
+    'REVERTED',
+    'CANCELLED',
+    'REORGED',
+  ],
+} as const;
+const CONFIDENCE_ENUM = {
+  type: 'string',
+  enum: ['UNOBSERVED', 'INCLUDED', 'DEPTH_CONFIRMED', 'RPC_FINALIZED', 'LOCAL_DEMO'],
+} as const;
+const RECONCILIATION_ENUM = {
+  type: 'string',
+  enum: ['NOT_CHECKED', 'MATCHED', 'MISMATCH'],
+} as const;
+const ATTEMPT_STATE_ENUM = {
+  type: 'string',
+  enum: [
+    'SIGNED',
+    'SUBMITTED',
+    'UNKNOWN',
+    'INCLUDED',
+    'SUCCEEDED',
+    'REVERTED',
+    'REPLACED',
+    'CANCELLED',
+    'REORGED',
+  ],
+} as const;
+
+export const PAYMENT_VIEW_SCHEMA = strictObject(
+  {
+    paymentId: UUID,
+    intentId: nullable(UUID),
+    deploymentId: nullable(UUID),
+    chainId: nullable(UINT_STRING),
+    invoice: nullable(
+      strictObject(
+        {
+          invoiceId: HASH32,
+          recipient: ADDRESS,
+          outputToken: ADDRESS,
+          outputAmountAtomic: UINT_STRING,
+        },
+        ['invoiceId', 'recipient', 'outputToken', 'outputAmountAtomic'],
+      ),
+    ),
+    // Populated from the resolved (possibly historical) intent's policy row -- null only until
+    // that resolution finds a row (never simply "not implemented"; see B1 item 1/INT-007).
+    authorized: nullable(
+      strictObject(
+        {
+          inputToken: nullable(ADDRESS),
+          maxInputAtomic: nullable(UINT_STRING),
+          routeId: nullable(HASH32),
+        },
+        ['inputToken', 'maxInputAtomic', 'routeId'],
+      ),
+    ),
+    policyDecision: POLICY_DECISION_ENUM,
+    executionStatus: EXECUTION_STATUS_ENUM,
+    confidence: CONFIDENCE_ENUM,
+    reconciliation: RECONCILIATION_ENUM,
+    reasonCode: nullable({ type: 'string' }),
+    settlement: nullable(
+      strictObject(
+        {
+          actualInputAtomic: nullable(UINT_STRING),
+          outputDeliveredAtomic: nullable(UINT_STRING),
+          subsidyAmountAtomic: UINT_STRING,
+        },
+        ['actualInputAtomic', 'outputDeliveredAtomic', 'subsidyAmountAtomic'],
+      ),
+    ),
+    transaction: nullable(
+      strictObject({ hash: HASH32, replacementOf: nullable(HASH32) }, ['hash', 'replacementOf']),
+    ),
+    observedAt: nullable(
+      strictObject(
+        {
+          blockNumber: nullable(UINT_STRING),
+          blockHash: HASH32,
+          canonical: { type: 'boolean' },
+          observedAt: { type: 'string' },
+        },
+        ['blockNumber', 'blockHash', 'canonical', 'observedAt'],
+      ),
+    ),
+    vaultId: UUID,
+  },
+  [
+    'paymentId',
+    'intentId',
+    'deploymentId',
+    'chainId',
+    'invoice',
+    'authorized',
+    'policyDecision',
+    'executionStatus',
+    'confidence',
+    'reconciliation',
+    'reasonCode',
+    'settlement',
+    'transaction',
+    'observedAt',
+    'vaultId',
+  ],
+);
+
+export const TRANSACTION_VIEW_SCHEMA = strictObject(
+  {
+    hash: HASH32,
+    from: nullable(ADDRESS),
+    nonce: nullable(UINT_STRING),
+    state: ATTEMPT_STATE_ENUM,
+    replacementOf: nullable(HASH32),
+    canonicalReceiptIdentity: nullable(
+      strictObject(
+        { blockHash: HASH32, blockNumber: nullable(UINT_STRING), canonical: { type: 'boolean' } },
+        ['blockHash', 'blockNumber', 'canonical'],
+      ),
+    ),
+    confidence: nullable(CONFIDENCE_ENUM),
+    authorizedPayment: nullable(PAYMENT_VIEW_SCHEMA),
+  },
+  [
+    'hash',
+    'from',
+    'nonce',
+    'state',
+    'replacementOf',
+    'canonicalReceiptIdentity',
+    'confidence',
+    'authorizedPayment',
+  ],
+);
+
 export const TRANSACTION_QUERY = strictObject({ deploymentId: UUID }, ['deploymentId']);
+
+// GET /v1/payments/{id}/timeline's actual shape (src/routes/payments.ts) -- `body` is the raw
+// event payload each producer wrote (worker submitPayment.ts/reconcile.ts), intentionally an open
+// object rather than a per-event-type union: the endpoint's own contract is the event envelope,
+// not every producer's internal shape.
+export const TIMELINE_PAGE_SCHEMA = strictObject(
+  {
+    items: {
+      type: 'array',
+      items: strictObject(
+        {
+          eventId: UUID,
+          type: { type: 'string', minLength: 1 },
+          createdAt: { type: 'string' },
+          body: { type: 'object' },
+        },
+        ['eventId', 'type', 'createdAt', 'body'],
+      ),
+    },
+    nextCursor: nullable({ type: 'string' }),
+  },
+  ['items', 'nextCursor'],
+);
