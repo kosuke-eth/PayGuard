@@ -203,6 +203,25 @@ export async function resolveSessionByTokenHash(
   };
 }
 
+/**
+ * Rotates a live BROWSER session's CSRF token (B1, item 6: session recovery after a page reload).
+ * The csrf token is stored ONLY as a hash (never recoverable in plaintext once issued), so after a
+ * reload discards the in-memory value, the only safe recovery is to mint and store a NEW one --
+ * never to weaken the CSRF check by making it optional. Scoped by session id AND still-valid
+ * (`revoked_at IS NULL AND expires_at > now`), so a revoked/expired session cannot be silently
+ * revived by this call.
+ */
+export async function rotateSessionCsrfToken(
+  db: Queryable,
+  params: { sessionId: string; csrfTokenHash: Buffer; now: Date },
+): Promise<boolean> {
+  const result = await db.query(
+    'UPDATE sessions SET csrf_token_hash = $2 WHERE id = $1 AND revoked_at IS NULL AND expires_at > $3',
+    [params.sessionId, params.csrfTokenHash, params.now],
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
 /** Revokes the API session only. Explicitly does not touch any on-chain agent authority. */
 export async function revokeSession(
   client: pg.PoolClient,

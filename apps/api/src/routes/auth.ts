@@ -15,6 +15,7 @@ import {
   createSession,
   findOrCreateWallet,
   revokeSession,
+  rotateSessionCsrfToken,
   withTransaction,
 } from '@payguard/db';
 import type { Address, Hash32 } from '@payguard/domain';
@@ -212,6 +213,42 @@ export function registerAuthRoutes(app: FastifyInstance, context: AppContext): v
       );
     },
   );
+
+  // B1 (item 6): the ONLY recovery a browser client has after a reload. The httpOnly session
+  // cookie survives a reload; the in-memory CSRF token and walletAddress the frontend was holding
+  // do not. Since `csrf_token_hash` is stored one-way, the original token can never be handed
+  // back -- the honest recovery is to mint and store a NEW one (never to weaken/skip the CSRF
+  // check to work around its absence). A GET is not itself subject to `enforceBrowserMutationGuards`
+  // (that guard only applies to mutating methods), so this read is safe to call with only the
+  // cookie present; every subsequent MUTATING request still needs the freshly-rotated token.
+  app.get('/v1/auth/session', async (request, reply) => {
+    const auth = requireSession(request);
+    let csrfToken: string | null = null;
+    if (auth.kind === 'BROWSER') {
+      csrfToken = generateToken();
+      const rotated = await rotateSessionCsrfToken(context.pool, {
+        sessionId: auth.session.id,
+        csrfTokenHash: sha256(csrfToken),
+        now: context.now(),
+      });
+      if (!rotated) {
+        // The session was revoked/expired in the instant between resolveSession's read and this
+        // write -- refuse rather than hand back a token bound to a session that is no longer live.
+        throw new ApiError('INVALID_SESSION', 'session is no longer valid');
+      }
+    }
+    return reply.status(200).send(
+      successEnvelope(
+        {
+          walletAddress: auth.walletAddress,
+          sessionKind: auth.kind,
+          sessionExpiresAt: auth.session.expiresAt.toISOString(),
+          ...(auth.kind === 'BROWSER' ? { csrfToken } : {}),
+        },
+        String(request.id),
+      ),
+    );
+  });
 
   app.post('/v1/auth/logout', { schema: { body: EMPTY_BODY } }, async (request, reply) => {
     const auth = requireSession(request);
