@@ -18,6 +18,7 @@ import type { AppContext } from './context.js';
 import { ApiError, failureEnvelope } from './errors.js';
 import { registerAuthRoutes } from './routes/auth.js';
 import { registerConfigRoutes } from './routes/config.js';
+import { registerDemoRoutes } from './routes/demo.js';
 import { registerHealthRoutes } from './routes/health.js';
 import { registerInvoiceRoutes } from './routes/invoices.js';
 import { registerObservationRoutes } from './routes/observations.js';
@@ -129,6 +130,7 @@ export function buildApp(context: AppContext): BuiltApp {
   registerInvoiceRoutes(app, context);
   registerPaymentIntentRoutes(app, context);
   registerPaymentReadRoutes(app, context);
+  registerDemoRoutes(app, context);
 
   return { app, routes };
 }

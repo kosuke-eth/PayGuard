@@ -7,6 +7,7 @@
  * idempotency_keys row itself; the caller inserts everything else before committing.
  */
 import type pg from 'pg';
+import type { Queryable } from '../pool.js';
 
 export interface IdempotencyKeyRow {
   id: string;
@@ -36,6 +37,21 @@ function mapRow(row: Record<string, unknown>): IdempotencyKeyRow {
     responseBody: row.response_body ?? null,
     createdAt: row.created_at as Date,
   };
+}
+
+/**
+ * Bare-id read (B2: the demo bridge uses an idempotency row's own id as its durable `runId`, since
+ * a run IS exactly the idempotent-request record for `demo_run:{vaultId}`). Like every other bare-id
+ * read in this codebase, this MUST be paired with an explicit ownership predicate by the caller --
+ * `row.principalWalletId === auth.walletId` -- before anything derived from it is returned.
+ */
+export async function getIdempotencyKeyById(
+  db: Queryable,
+  id: string,
+): Promise<IdempotencyKeyRow | null> {
+  const result = await db.query('SELECT * FROM idempotency_keys WHERE id = $1', [id]);
+  const row = result.rows[0];
+  return row ? mapRow(row) : null;
 }
 
 export type BeginIdempotentRequestResult =

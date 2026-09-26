@@ -218,6 +218,133 @@ cmd_not_yet() {
   exit 1
 }
 
+# verify-mvp <gate>: non-recursive continuation surface for the B0-B5/F0-F3/R1 workflow
+# (docs/PAYGUARD_AGENT_WORKFLOW.md), added at B0. This does NOT call verify-stage
+# recursively -- it runs a focused, gate-specific check set directly. Only a gate whose
+# work actually landed may report PASS; everything else fails clearly below, named after
+# its real prerequisite, never a silent placeholder success.
+cmd_verify_mvp_B0() {
+  echo "==> verify-mvp B0 (baseline preservation + docs reconciliation smoke)"
+  mkdir -p docs/implementation/evidence/mvp-v2/B0/latest
+  run_step "pnpm typecheck (all workspace packages)" pnpm typecheck
+  run_step "pnpm lint (biome check, all workspace packages)" pnpm lint
+  run_step "shared ABI/schema drift (apps/api contract-drift suite vs API_CONTRACT.md + compiled ABI)" \
+    bash -c "pnpm --filter @payguard/api exec vitest run test/contract-drift.test.ts 2>&1 | tee docs/implementation/evidence/mvp-v2/B0/latest/contract-drift.log"
+  echo ""
+  echo "verify-mvp B0: PASS"
+  echo "This checks documentation/command-surface integrity and existing drift/typecheck/lint only."
+  echo "It does not re-prove Stage 1-5 behavior -- use 'verify-stage 05' for that regression."
+}
+
+# verify-mvp B2 (docs/implementation/checkpoints/B2.md): the bounded demo bridge -- schema/ABI
+# drift, EIP-712 deployment-binding invariant, and the full demo.test.ts PROVE suite (real
+# Postgres + Anvil + API + worker). Does not itself run B0/B1's own regressions again -- run
+# those separately if needed.
+cmd_verify_mvp_B2() {
+  echo "==> verify-mvp B2 (demo bridge: schema drift, EIP-712 deployment binding, PROVE suite)"
+  mkdir -p docs/implementation/evidence/mvp-v2/B2/latest
+  run_step "pnpm typecheck (all workspace packages)" pnpm typecheck
+  run_step "pnpm lint (biome check, all workspace packages)" pnpm lint
+  run_step "packages/domain (EIP-712 vectors incl. deployment-binding invariant)" \
+    bash -c "pnpm --filter @payguard/domain test 2>&1 | tee docs/implementation/evidence/mvp-v2/B2/latest/domain.log"
+  run_step "shared ABI/schema drift (apps/api contract-drift suite, includes DEMO_RUN_START_BODY)" \
+    bash -c "pnpm --filter @payguard/api exec vitest run test/contract-drift.test.ts 2>&1 | tee docs/implementation/evidence/mvp-v2/B2/latest/contract-drift.log"
+  run_step "packages/integration (public client + boundary check)" \
+    bash -c "pnpm --filter @payguard/integration test 2>&1 | tee docs/implementation/evidence/mvp-v2/B2/latest/integration.log"
+  run_step "demo bridge PROVE suite (real Postgres + Anvil + API + worker)" \
+    bash -c "pnpm --filter @payguard/api exec vitest run test/demo.test.ts 2>&1 | tee docs/implementation/evidence/mvp-v2/B2/latest/demo.log"
+  echo ""
+  echo "verify-mvp B2: PASS"
+  echo "This re-proves the demo bridge only. Run 'verify-stage 05' (or the individual package"
+  echo "suites) separately for the full B0-B1 regression this gate depends on."
+}
+
+# verify-mvp B3 (docs/implementation/checkpoints/B3.md): the real Uniswap v4 fixed-pool
+# exact-output adapter -- Foundry adapter suite + full Foundry regression (real PoolManager,
+# no mocks) + the v4 route's public-API end-to-end proof (real Anvil + Postgres + worker).
+# Does not itself run B0-B2's own regressions again -- run those separately if needed.
+cmd_verify_mvp_B3() {
+  echo "==> verify-mvp B3 (real Uniswap v4 fixed-pool exact-output adapter: bare protocol + public API)"
+  mkdir -p docs/implementation/evidence/mvp-v2/B3/latest
+  run_step "pnpm typecheck (all workspace packages)" pnpm typecheck
+  run_step "pnpm lint (biome check, all workspace packages)" pnpm lint
+  run_step "PayGuardV4Adapter Foundry suite (real PoolManager, bare protocol success/failure)" \
+    bash -c "cd contracts/core-v4 && forge test --match-contract PayGuardV4AdapterTest -vv 2>&1 | tee ../../docs/implementation/evidence/mvp-v2/B3/latest/adapter-suite.log"
+  run_step "full Foundry regression (all 12 suites, incl. invariant fuzzing)" \
+    bash -c "cd contracts/core-v4 && forge test 2>&1 | tee ../../docs/implementation/evidence/mvp-v2/B3/latest/forge-full.log"
+  run_step "shared ABI/schema drift (apps/api contract-drift suite -- confirms no client/manifest regen needed)" \
+    bash -c "pnpm --filter @payguard/api exec vitest run test/contract-drift.test.ts 2>&1 | tee docs/implementation/evidence/mvp-v2/B3/latest/contract-drift.log"
+  run_step "v4 route public-API end-to-end proof (real Anvil + Postgres + worker, distinct from the bare-protocol Foundry tests)" \
+    bash -c "pnpm --filter @payguard/api exec vitest run test/v4Route.test.ts 2>&1 | tee docs/implementation/evidence/mvp-v2/B3/latest/v4route.log"
+  echo ""
+  echo "verify-mvp B3: PASS"
+  echo "This re-proves the v4 fixed-pool adapter only. Run 'verify-mvp B2' (or the individual"
+  echo "package suites) separately for the B0-B2 regression this gate depends on."
+}
+
+# verify-mvp B4 (docs/implementation/checkpoints/B4.md): the real 1inch Aqua/SwapVM maker-
+# liquidation adapter -- Foundry adapter suite + full Foundry regression (real Aqua/SwapVM, no
+# mocks) + the ABI-only-shim equivalence check + the Aqua route's public-API end-to-end proof
+# (real Anvil + Postgres + worker). Does not itself run B0-B3's own regressions again.
+cmd_verify_mvp_B4() {
+  echo "==> verify-mvp B4 (real 1inch Aqua/SwapVM maker-liquidation adapter: bare protocol + public API)"
+  mkdir -p docs/implementation/evidence/mvp-v2/B4/latest
+  run_step "pnpm typecheck (all workspace packages)" pnpm typecheck
+  run_step "pnpm lint (biome check, all workspace packages)" pnpm lint
+  run_step "contracts/core-v4 build (must exist for contracts/aqua's cross-project deployCode)" \
+    bash -c "cd contracts/core-v4 && forge build 2>&1 | tee ../../docs/implementation/evidence/mvp-v2/B4/latest/core-v4-build.log"
+  run_step "PayGuardAquaAdapter Foundry suite (real Aqua/AquaSwapVMRouter, bare protocol success/failure)" \
+    bash -c "cd contracts/aqua && forge test -vv 2>&1 | tee ../../docs/implementation/evidence/mvp-v2/B4/latest/adapter-suite.log"
+  run_step "ABI-only shim equivalence (contracts/aqua's 0.8.30 shim vs the real 0.8.26 interfaces)" \
+    bash -c "cd contracts/aqua && node script/check-abi-equivalence.mjs 2>&1 | tee ../../docs/implementation/evidence/mvp-v2/B4/latest/abi-equivalence.log"
+  run_step "full core-v4 Foundry regression (confirms B4 made zero vault changes)" \
+    bash -c "cd contracts/core-v4 && forge test 2>&1 | tee ../../docs/implementation/evidence/mvp-v2/B4/latest/core-v4-forge-full.log"
+  run_step "shared ABI/schema drift (apps/api contract-drift suite)" \
+    bash -c "pnpm --filter @payguard/api exec vitest run test/contract-drift.test.ts 2>&1 | tee docs/implementation/evidence/mvp-v2/B4/latest/contract-drift.log"
+  run_step "Aqua route public-API end-to-end proof (real Anvil + Postgres + worker, distinct from the bare-protocol Foundry tests)" \
+    bash -c "pnpm --filter @payguard/api exec vitest run test/aquaRoute.test.ts 2>&1 | tee docs/implementation/evidence/mvp-v2/B4/latest/aquaroute.log"
+  echo ""
+  echo "verify-mvp B4: PASS"
+  echo "This re-proves the Aqua maker-liquidation adapter only. Run 'verify-mvp B3' (or the"
+  echo "individual package suites) separately for the B0-B3 regression this gate depends on."
+}
+
+# verify-mvp B5 (docs/implementation/checkpoints/B5.md): the tested backend handoff -- one
+# coherent fresh deployment provisioning direct+v4+Aqua together, both required sponsor routes'
+# ALLOW/ESCALATE/infeasible-swap through the real API/worker/vault/DB path, the fault/recovery
+# matrix, and the browser-safe @payguard/integration package -- NOT frontend/browser proof (F1-F3).
+cmd_verify_mvp_B5() {
+  echo "==> verify-mvp B5 (tested backend handoff: coherent 3-route deployment, both sponsor routes, fault/recovery matrix)"
+  mkdir -p docs/implementation/evidence/mvp-v2/B5/latest
+  run_step "pnpm typecheck (all workspace packages)" pnpm typecheck
+  run_step "pnpm lint (biome check, all workspace packages)" pnpm lint
+  run_step "fresh coherent demo deployment: direct + real v4 + real Aqua, one owner, one merchant identity (real Anvil + Postgres; safe to rerun -- reuses an existing matching deployment)" \
+    bash -c "cd apps/api && pnpm exec tsx scripts/demo-setup.ts 2>&1 | tee ../../docs/implementation/evidence/mvp-v2/B5/latest/demo-setup.log"
+  run_step "v4 route public-API proof: ALLOW, owner-approved ESCALATE, real infeasible-swap rejection, real timeline read (real Anvil + Postgres + worker)" \
+    bash -c "pnpm --filter @payguard/api exec vitest run test/v4Route.test.ts 2>&1 | tee docs/implementation/evidence/mvp-v2/B5/latest/v4route.log"
+  run_step "Aqua route public-API proof: ALLOW, owner-approved ESCALATE, real infeasible-fill rejection (real Anvil + Postgres + worker)" \
+    bash -c "pnpm --filter @payguard/api exec vitest run test/aquaRoute.test.ts 2>&1 | tee docs/implementation/evidence/mvp-v2/B5/latest/aquaroute.log"
+  run_step "full apps/api suite (130 cases as of B5 -- both routes plus every B0-B4 regression)" \
+    bash -c "pnpm --filter @payguard/api exec vitest run 2>&1 | tee docs/implementation/evidence/mvp-v2/B5/latest/api-full.log"
+  run_step "full apps/worker suite (fault/recovery matrix, SPEC-037 reorg/nonce regression -- run only after apps/api's own suite has fully exited: both share the payguard_test database)" \
+    bash -c "pnpm --filter @payguard/worker exec vitest run 2>&1 | tee docs/implementation/evidence/mvp-v2/B5/latest/worker-full.log"
+  run_step "packages/integration (browser-bundle-safety: a real esbuild platform:browser build with no node-builtin/secret imports)" \
+    bash -c "pnpm --filter @payguard/integration exec vitest run 2>&1 | tee docs/implementation/evidence/mvp-v2/B5/latest/integration-full.log"
+  run_step "shared ABI/schema drift (apps/api contract-drift suite, incl. the new TIMELINE_PAGE_SCHEMA-backed timeline read)" \
+    bash -c "pnpm --filter @payguard/api exec vitest run test/contract-drift.test.ts 2>&1 | tee docs/implementation/evidence/mvp-v2/B5/latest/contract-drift.log"
+  echo ""
+  echo "verify-mvp B5: PASS"
+  echo "This re-proves the tested backend handoff only -- real browser/wallet behavior, visual/UI,"
+  echo "and full-product tests are F1-F3 scope (docs/PAYGUARD_FRONTEND_PROMPTS.md), not covered here."
+}
+
+cmd_not_yet_mvp() {
+  local gate="$1" prereq="$2"
+  echo "FAIL: 'verify-mvp ${gate}' is not implemented yet."
+  echo "Gate ${gate} has not been built in this repository. Prerequisite: ${prereq} (see docs/PAYGUARD_AGENT_WORKFLOW.md)."
+  exit 1
+}
+
 main() {
   local cmd="${1:-}"
   case "$cmd" in
@@ -239,12 +366,38 @@ main() {
       ;;
     verify-all) cmd_not_yet 7 "verify-all" ;;
     preflight) cmd_not_yet 7 "preflight" ;;
-    demo) cmd_not_yet 7 "demo" ;;
+    demo:setup)
+      bash -c "cd apps/api && pnpm exec tsx scripts/demo-setup.ts"
+      ;;
+    demo:reset)
+      bash -c "cd apps/api && pnpm exec tsx scripts/demo-reset.ts"
+      ;;
     export-integration) cmd_not_yet 7 "export-integration" ;;
+    verify-mvp)
+      local gate="${2:-}"
+      case "$gate" in
+        B0) cmd_verify_mvp_B0 ;;
+        B1) cmd_not_yet_mvp B1 "B0 PASS" ;;
+        B2) cmd_verify_mvp_B2 ;;
+        B3) cmd_verify_mvp_B3 ;;
+        B4) cmd_verify_mvp_B4 ;;
+        B5) cmd_verify_mvp_B5 ;;
+        F0) cmd_not_yet_mvp F0 "B5 PASS by default (B2 PASS permits an explicitly selected parallel workflow)" ;;
+        F1) cmd_not_yet_mvp F1 "F0 PASS and B2 PASS" ;;
+        F2) cmd_not_yet_mvp F2 "F1 PASS" ;;
+        F3) cmd_not_yet_mvp F3 "F2 PASS and B5 PASS" ;;
+        R1) cmd_not_yet_mvp R1 "B5 and F3 PASS on the combined tree" ;;
+        all) cmd_not_yet_mvp all "every individual gate implemented (non-recursive: run each gate separately)" ;;
+        *)
+          echo "usage: $0 verify-mvp <B0-B5|F0-F3|R1>" >&2
+          exit 1
+          ;;
+      esac
+      ;;
     db:start) cmd_db_start ;;
     db:check) cmd_db_check ;;
     *)
-      echo "usage: $0 {verify-stage <01-07>|verify-all|preflight|demo|export-integration|db:start|db:check}" >&2
+      echo "usage: $0 {verify-stage <01-07>|verify-mvp <B0-B5|F0-F3|R1>|verify-all|preflight|demo:setup|demo:reset|export-integration|db:start|db:check}" >&2
       exit 1
       ;;
   esac

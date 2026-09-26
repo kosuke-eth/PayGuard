@@ -228,3 +228,32 @@ export const KEYSET_QUERY = {
 } as const;
 
 export const TRANSACTION_QUERY = strictObject({ deploymentId: UUID }, ['deploymentId']);
+
+/**
+ * B2 demo bridge (`GET /v1/demo/scenarios`, `POST /v1/demo/runs`, `GET /v1/demo/runs/{id}`,
+ * `docs/PAYGUARD_INTEGRATION_BOUNDARY.md` section 5): a discriminated union, not a permissive bag
+ * of optional fields -- the `duplicate` scenario is the only one that may name a `sourcePaymentId`,
+ * and every other scenario forbids it outright (`strictObject`'s `additionalProperties: false`).
+ */
+export const DEMO_RUN_START_BODY = {
+  oneOf: [
+    strictObject(
+      {
+        profileId: UUID,
+        scenarioId: {
+          type: 'string',
+          enum: ['compute', 'hotel', 'over_budget', 'unauthorized_merchant'],
+        },
+      },
+      ['profileId', 'scenarioId'],
+    ),
+    strictObject(
+      {
+        profileId: UUID,
+        scenarioId: { type: 'string', const: 'duplicate' },
+        sourcePaymentId: UUID,
+      },
+      ['profileId', 'scenarioId', 'sourcePaymentId'],
+    ),
+  ],
+} as const;

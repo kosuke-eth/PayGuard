@@ -100,6 +100,11 @@ export function createPayGuardClient(options: PayGuardClientOptions) {
       callPayGuardApi<T>(options, 'POST', '/v1/payment-intents', body),
     getPayment: <T>(paymentId: string) =>
       callPayGuardApi<T>(options, 'GET', `/v1/payments/${paymentId}`),
+    /** B2 demo bridge, demo-configured deployments only -- see `DEMO_RUN_START_BODY`. */
+    listDemoScenarios: <T>() => callPayGuardApi<T>(options, 'GET', '/v1/demo/scenarios'),
+    startDemoRun: <T>(body: { profileId: string; scenarioId: string; sourcePaymentId?: string }) =>
+      callPayGuardApi<T>(options, 'POST', '/v1/demo/runs', body),
+    getDemoRun: <T>(runId: string) => callPayGuardApi<T>(options, 'GET', `/v1/demo/runs/${runId}`),
   };
 }
 
