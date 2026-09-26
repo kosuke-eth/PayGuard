@@ -1,0 +1,34 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+test = "test"
+script = "script"
+# Matches the actual installed 1inch/swap-vm@v1.0.2 and 1inch/aqua@0.1.0 build config exactly
+# (both projects' own foundry.toml, inspected on disk this session -- not assumed): 0.8.30, via-ir.
+# This is a SEPARATE compiler/dependency graph from contracts/core-v4 (pinned 0.8.26) -- the two
+# are never merged; PayGuardAquaAdapter talks to the vault only through an ABI-only interface shim
+# (src/interfaces/IPayGuardSettlementAdapterShim.sol), proven artifact-equivalent to the real
+# 0.8.26 interface by script/check-abi-equivalence.mjs (run automatically as part of
+# `./scripts/payguard verify-mvp B4`, not merely a standalone manual script).
+solc = "0.8.30"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 700
+via_ir = true
+bytecode_hash = "none"
+fs_permissions = [
+    { access = "read", path = "./" },
+    { access = "read", path = "../core-v4/out" },
+    { access = "read-write", path = "../../docs/implementation/evidence" },
+]
+
+# Matches lib/swap-vm/foundry.toml and lib/aqua/foundry.toml's own [profile.default.optimizer_details]
+# EXACTLY (inspected on disk) -- their own source does not compile without it (stack-too-deep in
+# TakerTraits.sol even with plain via_ir=true), confirmed by reproducing the failure first.
+[profile.default.optimizer_details]
+yul = true
+yulDetails = { stackAllocation = true, optimizerSteps = "dhfoDgvulfnTUtnIf[xa[r]EscLMcCTUtTOntnfDIulLculVcul Tpeul]jmul[jul] VcTOcul jmul : fDnTOcmu" }
+
+[profile.default.fuzz]
+runs = 256

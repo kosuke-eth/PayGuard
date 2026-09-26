@@ -7,3 +7,18 @@
 [submodule "contracts/core-v4/lib/openzeppelin-contracts"]
 	path = contracts/core-v4/lib/openzeppelin-contracts
 	url = https://github.com/OpenZeppelin/openzeppelin-contracts
+[submodule "contracts/aqua/lib/forge-std"]
+	path = contracts/aqua/lib/forge-std
+	url = https://github.com/foundry-rs/forge-std
+[submodule "contracts/aqua/lib/aqua"]
+	path = contracts/aqua/lib/aqua
+	url = https://github.com/1inch/aqua
+[submodule "contracts/aqua/lib/swap-vm"]
+	path = contracts/aqua/lib/swap-vm
+	url = https://github.com/1inch/swap-vm
+[submodule "contracts/aqua/lib/openzeppelin-contracts"]
+	path = contracts/aqua/lib/openzeppelin-contracts
+	url = https://github.com/OpenZeppelin/openzeppelin-contracts
+[submodule "contracts/aqua/lib/solidity-utils"]
+	path = contracts/aqua/lib/solidity-utils
+	url = https://github.com/1inch/solidity-utils
